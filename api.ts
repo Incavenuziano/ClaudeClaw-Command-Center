@@ -723,32 +723,33 @@ interface SendMessageResult {
 interface SatelliteConfig {
   token: string | undefined;
   chatId: string;
-  systemPrompt: string;
 }
 
-async function callClaude(systemPrompt: string, userMessage: string): Promise<string> {
-  loadEnv();
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error("ANTHROPIC_API_KEY não configurada");
+async function callClaudeSDK(satelliteId: string, userMessage: string): Promise<string> {
+  const venvPython = "/home/danilo/claudeclaw/.venv/bin/python3";
+  const scriptPath = join(import.meta.dir, "satellite_chat.py");
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages: [{ role: "user", content: userMessage }],
-    }),
-    signal: AbortSignal.timeout(30000),
+  const proc = Bun.spawn([venvPython, scriptPath, satelliteId, userMessage], {
+    cwd: import.meta.dir,
+    stdout: "pipe",
+    stderr: "pipe",
   });
 
-  const data = await res.json() as { content?: Array<{ text: string }> };
-  return data.content?.[0]?.text || "Sem resposta";
+  const output = await new Response(proc.stdout).text();
+  const exitCode = await proc.exited;
+
+  if (exitCode !== 0) {
+    const stderr = await new Response(proc.stderr).text();
+    throw new Error(stderr || "Erro ao executar Claude SDK");
+  }
+
+  try {
+    const data = JSON.parse(output) as { response?: string; error?: string };
+    if (data.error) throw new Error(data.error);
+    return data.response || "Sem resposta";
+  } catch {
+    return output.trim() || "Sem resposta";
+  }
 }
 
 async function sendTelegramMessage(token: string, chatId: string, text: string): Promise<{ ok: boolean; messageId?: number; error?: string }> {
@@ -777,26 +778,10 @@ export async function sendToSatellite(satelliteId: string, message: string): Pro
   const chatId = process.env.TELEGRAM_CHAT_ID || "416112154";
 
   const config: Record<string, SatelliteConfig> = {
-    adv: {
-      token: process.env.TELEGRAM_BOT_TOKEN_ADV || genericToken,
-      chatId,
-      systemPrompt: "Você é o assistente jurídico do Dr. Danilo Almeida, advogado OAB/DF 59.724. Responda de forma profissional e concisa.",
-    },
-    araticum: {
-      token: process.env.TELEGRAM_BOT_TOKEN_ARATICUM || genericToken,
-      chatId,
-      systemPrompt: "Você é o assistente da Araticum Consultoria, especializada em licitações públicas e Lei 14.133/2021. Responda de forma técnica e objetiva.",
-    },
-    designer: {
-      token: process.env.TELEGRAM_BOT_TOKEN_DESIGNER || genericToken,
-      chatId,
-      systemPrompt: "Você é um assistente de design criativo. Responda de forma criativa e visual.",
-    },
-    claudeclaw: {
-      token: process.env.TELEGRAM_BOT_TOKEN_CLAUDECLAW || genericToken,
-      chatId,
-      systemPrompt: "Você é o ClaudeClaw, assistente pessoal do Danilo. Seja direto, amigável e útil. Responda em português brasileiro.",
-    },
+    adv: { token: process.env.TELEGRAM_BOT_TOKEN_ADV || genericToken, chatId },
+    araticum: { token: process.env.TELEGRAM_BOT_TOKEN_ARATICUM || genericToken, chatId },
+    designer: { token: process.env.TELEGRAM_BOT_TOKEN_DESIGNER || genericToken, chatId },
+    claudeclaw: { token: process.env.TELEGRAM_BOT_TOKEN_CLAUDECLAW || genericToken, chatId },
   };
 
   const sat = config[satelliteId];
@@ -805,8 +790,8 @@ export async function sendToSatellite(satelliteId: string, message: string): Pro
   }
 
   try {
-    // Processa com Claude
-    const response = await callClaude(sat.systemPrompt, message);
+    // Processa com Claude SDK (usa assinatura, não API)
+    const response = await callClaudeSDK(satelliteId, message);
 
     // Envia resposta no Telegram
     const result = await sendTelegramMessage(sat.token, sat.chatId, response);

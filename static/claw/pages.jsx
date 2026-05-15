@@ -6,7 +6,7 @@ function Dashboard({ data, setActive }) {
   return (
     <div className="hc-flex-col" style={{ gap: 16 }}>
       <div className="hc-grid hc-grid-4">
-        <Stat label="Agentes" value={data.agents.filter(a=>a.status==='active').length + ' / ' + data.agents.length} icon="agents" spark={[2,3,3,4,4,4,5,4,4,5,5,6]} />
+        <Stat label="Agentes" value={data.agents.filter(a=>a.status==='online'||a.status==='active').length + ' / ' + data.agents.length} icon="agents" spark={[2,3,3,4,4,4,5,4,4,5,5,6]} />
         <Stat label="Sessões" value={data.sessions.filter(s=>s.status==='active').length} icon="sessions" spark={[1,1,1,2,2,1,1,2,2,2,2,2]} />
         <Stat label="Tokens hoje" value={(data.usage.today.tokens/1000).toFixed(1) + 'k'} icon="zap" spark={data.usage.hourly.slice(-12)} />
         <Stat label="Custo hoje" value={'$' + data.usage.today.cost.toFixed(2)} delta={data.usage.week?.cost ? `$${data.usage.week.cost.toFixed(0)} semana` : ''} icon="usage" spark={data.usage.hourly.slice(-12).map(v => v * 0.008)} />
