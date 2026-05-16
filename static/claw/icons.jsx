@@ -56,6 +56,7 @@ const iconPaths = {
   download: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3',
   filter: 'M22 3H2l8 9.5V19l4 2v-8.5z',
   dot: 'M12 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2z',
+  grid: 'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z',
   orchestration: 'M12 3L3 8v8l9 5 9-5V8zM12 3v13M3 8l9 5M21 8l-9 5',
 };
 

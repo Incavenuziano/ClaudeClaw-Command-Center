@@ -2,6 +2,7 @@
 const NAV = [
   { sector: 'Core', items: [
     { key: 'dashboard', icon: 'dashboard', label: 'Dashboard', badge: null },
+    { key: 'kanban',    icon: 'grid',      label: 'Kanban',    badge: null },
     { key: 'activity',  icon: 'activity',  label: 'Atividade', badge: null },
     { key: 'usage',     icon: 'usage',     label: 'Consumo',   badge: null },
   ]},
@@ -20,11 +21,13 @@ const NAV = [
     { key: 'doctor',    icon: 'doctor',    label: 'Doctor',    badge: null },
     { key: 'logs',      icon: 'logs',      label: 'Logs',      badge: null },
     { key: 'terminal',  icon: 'terminal',  label: 'Terminal',  badge: null },
+    { key: 'live',      icon: 'zap',       label: 'Live Exec', badge: null },
   ]},
 ];
 
 const PAGE_META = {
   dashboard:  { title: 'Dashboard',      sub: 'Visão geral do ecossistema' },
+  kanban:     { title: 'Kanban',         sub: 'Status visual de agentes e sessões' },
   activity:   { title: 'Atividade',      sub: 'Timeline de eventos' },
   usage:      { title: 'Consumo',        sub: 'Tokens · custo · orçamento' },
   agents:     { title: 'Agentes',        sub: 'Plugins e satellites' },
@@ -37,6 +40,7 @@ const PAGE_META = {
   doctor:     { title: 'Doctor',         sub: 'Diagnóstico do sistema' },
   logs:       { title: 'Logs',           sub: 'Log estruturado' },
   terminal:   { title: 'Terminal',       sub: 'Execute comandos' },
+  live:       { title: 'Live Execution', sub: 'Veja comandos em tempo real' },
 };
 
 function Sidebar({ active, onNav, collapsed, setCollapsed, mobileOpen }) {

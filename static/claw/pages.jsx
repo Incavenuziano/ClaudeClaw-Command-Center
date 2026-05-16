@@ -2,10 +2,96 @@
 const { useState: usP, useEffect: ueP, useMemo: umP, useRef: urP } = React;
 const { formatSaoPauloTime } = window.CC_TIME;
 
+/* Health Score Gauge — visual circular indicator */
+function HealthGauge({ score, size = 100 }) {
+  const radius = 42;
+  const circumference = 2 * Math.PI * radius;
+  const progress = (score / 100) * circumference;
+  const color = score >= 80 ? 'var(--success)' : score >= 60 ? 'var(--warning)' : 'var(--danger)';
+  const bgColor = score >= 80 ? 'var(--success-bg)' : score >= 60 ? 'var(--warning-bg)' : 'var(--danger-bg)';
+  const label = score >= 80 ? 'Saudável' : score >= 60 ? 'Atenção' : 'Crítico';
+
+  return (
+    <div className="hc-health-gauge" style={{ width: size, height: size }}>
+      <svg viewBox="0 0 100 100" style={{ transform: 'rotate(-90deg)' }}>
+        <circle
+          cx="50" cy="50" r={radius}
+          fill="none"
+          stroke="var(--border-subtle)"
+          strokeWidth="8"
+        />
+        <circle
+          cx="50" cy="50" r={radius}
+          fill="none"
+          stroke={color}
+          strokeWidth="8"
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={circumference - progress}
+          style={{ transition: 'stroke-dashoffset 0.6s ease' }}
+        />
+      </svg>
+      <div className="hc-health-gauge-inner">
+        <span className="hc-health-gauge-value" style={{ color }}>{score}</span>
+        <span className="hc-health-gauge-label">{label}</span>
+      </div>
+    </div>
+  );
+}
+
+function calculateHealthScore(data) {
+  let score = 100;
+  let factors = [];
+
+  // Agentes online (peso 25)
+  const agentsOnline = data.agents.filter(a => a.status === 'online' || a.status === 'active').length;
+  const agentsTotal = data.agents.length || 1;
+  const agentScore = (agentsOnline / agentsTotal) * 25;
+  score = agentScore;
+  if (agentScore < 20) factors.push('Poucos agentes ativos');
+
+  // Satellites online (peso 20)
+  const satsOnline = data.satellites.filter(s => s.status === 'online').length;
+  const satsTotal = data.satellites.length || 1;
+  const satScore = (satsOnline / satsTotal) * 20;
+  score += satScore;
+  if (satScore < 15) factors.push('Satellites offline');
+
+  // Crons sem erro (peso 25)
+  const cronsOk = data.cron.filter(c => c.last !== 'err').length;
+  const cronsTotal = data.cron.length || 1;
+  const cronScore = (cronsOk / cronsTotal) * 25;
+  score += cronScore;
+  if (cronScore < 20) factors.push('Crons com erro');
+
+  // Custo dentro do limite (peso 15) - assume $50/dia como limite
+  const dailyCost = data.usage?.today?.cost || 0;
+  const costScore = dailyCost <= 50 ? 15 : dailyCost <= 100 ? 10 : 5;
+  score += costScore;
+  if (costScore < 15) factors.push('Custo elevado');
+
+  // Sistema respondendo (peso 15)
+  const systemOk = data.systemHealth?.version ? 15 : 0;
+  score += systemOk;
+
+  return { score: Math.round(score), factors };
+}
+
 function Dashboard({ data, setActive }) {
+  const health = umP(() => calculateHealthScore(data), [data]);
+
   return (
     <div className="hc-flex-col" style={{ gap: 16 }}>
-      <div className="hc-grid hc-grid-4">
+      <div className="hc-grid hc-grid-5">
+        <div className="hc-health-card">
+          <HealthGauge score={health.score} size={90} />
+          <div className="hc-health-info">
+            <span className="hc-health-title">Health Score</span>
+            {health.factors.length > 0 && (
+              <span className="hc-health-factors">{health.factors.slice(0, 2).join(' · ')}</span>
+            )}
+          </div>
+        </div>
         <Stat label="Agentes" value={data.agents.filter(a=>a.status==='online'||a.status==='active').length + ' / ' + data.agents.length} icon="agents" spark={[2,3,3,4,4,4,5,4,4,5,5,6]} />
         <Stat label="Sessões" value={data.sessions.filter(s=>s.status==='active').length} icon="sessions" spark={[1,1,1,2,2,1,1,2,2,2,2,2]} />
         <Stat label="Tokens hoje" value={(data.usage.today.tokens/1000).toFixed(1) + 'k'} icon="zap" spark={data.usage.hourly.slice(-12)} />
@@ -775,6 +861,373 @@ function TerminalPage() {
   );
 }
 
+// Live Execution — Streaming de comandos em tempo real
+function LiveExecutionPage({ data }) {
+  const [executions, setExecutions] = usP([]);
+  const [connected, setConnected] = usP(false);
+  const [filter, setFilter] = usP('all');
+  const wsRef = urP(null);
+  const containerRef = urP(null);
+
+  ueP(() => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
+    wsRef.current = ws;
+
+    ws.onopen = () => setConnected(true);
+    ws.onclose = () => setConnected(false);
+    ws.onerror = () => setConnected(false);
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'history') {
+          setExecutions(msg.data || []);
+        } else if (msg.type === 'execution') {
+          setExecutions(prev => {
+            const existing = prev.findIndex(e => e.id === msg.data.id);
+            if (existing >= 0) {
+              const updated = [...prev];
+              updated[existing] = msg.data;
+              return updated;
+            }
+            return [msg.data, ...prev].slice(0, 50);
+          });
+        }
+      } catch (e) {
+        console.error('WS parse error:', e);
+      }
+    };
+
+    // Ping para manter conexão
+    const pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send('ping');
+      }
+    }, 30000);
+
+    return () => {
+      clearInterval(pingInterval);
+      ws.close();
+    };
+  }, []);
+
+  // Auto-scroll quando novas execuções chegam
+  ueP(() => {
+    if (containerRef.current) {
+      containerRef.current.scrollTop = 0;
+    }
+  }, [executions.length]);
+
+  const filtered = filter === 'all'
+    ? executions
+    : executions.filter(e => e.status === filter);
+
+  const statusIcon = (status) => {
+    switch (status) {
+      case 'running': return '⟳';
+      case 'completed': return '✓';
+      case 'error': return '✗';
+      default: return '•';
+    }
+  };
+
+  const statusColor = (status) => {
+    switch (status) {
+      case 'running': return 'var(--info)';
+      case 'completed': return 'var(--success)';
+      case 'error': return 'var(--danger)';
+      default: return 'var(--muted)';
+    }
+  };
+
+  const formatTime = (ts) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+
+  return (
+    <Panel
+      title="Live Execution"
+      icon="terminal"
+      sub={connected ? 'streaming ativo' : 'desconectado'}
+      actions={
+        <div className="hc-flex" style={{ gap: 8 }}>
+          <span className={`hc-dot ${connected ? 'ok' : 'err'}`} style={{
+            width: 8, height: 8, borderRadius: '50%',
+            backgroundColor: connected ? 'var(--success)' : 'var(--danger)',
+            animation: connected ? 'pulse 2s infinite' : 'none'
+          }} />
+          <select
+            value={filter}
+            onChange={e => setFilter(e.target.value)}
+            className="hc-select sm"
+            style={{ fontSize: 12, padding: '4px 8px' }}
+          >
+            <option value="all">Todos</option>
+            <option value="running">Em execução</option>
+            <option value="completed">Concluídos</option>
+            <option value="error">Erros</option>
+          </select>
+        </div>
+      }
+    >
+      <div
+        ref={containerRef}
+        className="hc-live-exec-container"
+        style={{
+          margin: -14,
+          maxHeight: 'calc(100vh - 200px)',
+          overflowY: 'auto',
+          fontFamily: 'var(--mono)'
+        }}
+      >
+        {filtered.length === 0 ? (
+          <div className="hc-empty" style={{ padding: 40, textAlign: 'center', color: 'var(--muted)' }}>
+            {connected ? 'Aguardando execuções...' : 'Conectando ao servidor...'}
+          </div>
+        ) : (
+          filtered.map((exec, i) => (
+            <div
+              key={exec.id}
+              className="hc-exec-item"
+              style={{
+                padding: '12px 14px',
+                borderBottom: '1px solid var(--border)',
+                backgroundColor: exec.status === 'running' ? 'var(--surface-hover)' : 'transparent',
+                transition: 'background-color 0.2s'
+              }}
+            >
+              <div className="hc-flex" style={{ justifyContent: 'space-between', marginBottom: 6 }}>
+                <div className="hc-flex" style={{ gap: 8, alignItems: 'center' }}>
+                  <span style={{
+                    color: statusColor(exec.status),
+                    fontSize: 14,
+                    animation: exec.status === 'running' ? 'spin 1s linear infinite' : 'none'
+                  }}>
+                    {statusIcon(exec.status)}
+                  </span>
+                  <span className="hc-mono" style={{ fontSize: 11, color: 'var(--muted)' }}>
+                    {formatTime(exec.timestamp)}
+                  </span>
+                  {exec.exitCode !== undefined && exec.exitCode !== 0 && (
+                    <Tag tone="err" style={{ fontSize: 10 }}>exit {exec.exitCode}</Tag>
+                  )}
+                </div>
+                <span className="hc-mono" style={{ fontSize: 10, color: 'var(--muted)' }}>
+                  #{exec.id.slice(-6)}
+                </span>
+              </div>
+              <div
+                className="hc-exec-cmd"
+                style={{
+                  fontSize: 12,
+                  color: 'var(--text-primary)',
+                  padding: '6px 10px',
+                  backgroundColor: 'var(--surface)',
+                  borderRadius: 4,
+                  marginBottom: exec.output ? 8 : 0,
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-all'
+                }}
+              >
+                <span style={{ color: 'var(--success)', marginRight: 8 }}>$</span>
+                {exec.command}
+              </div>
+              {exec.output && (
+                <pre
+                  className="hc-exec-output"
+                  style={{
+                    fontSize: 11,
+                    color: exec.status === 'error' ? 'var(--danger)' : 'var(--text-sec)',
+                    margin: 0,
+                    padding: '8px 10px',
+                    backgroundColor: 'var(--bg)',
+                    borderRadius: 4,
+                    maxHeight: 200,
+                    overflowY: 'auto',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-all'
+                  }}
+                >
+                  {exec.output.slice(0, 2000)}
+                  {exec.output.length > 2000 && '\n... (truncado)'}
+                </pre>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+      <style>{`
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
+        }
+      `}</style>
+    </Panel>
+  );
+}
+
+/* ============================================================
+   KANBAN BOARD — Visualização de status de agentes/sessões
+   ============================================================ */
+
+const KANBAN_COLUMNS = {
+  agents: [
+    { key: 'working', label: 'Trabalhando', statuses: ['active', 'online', 'working'], icon: 'zap' },
+    { key: 'waiting', label: 'Aguardando', statuses: ['waiting', 'idle', 'paused'], icon: 'clock' },
+    { key: 'completed', label: 'Concluído', statuses: ['completed', 'done', 'finished'], icon: 'check' },
+    { key: 'error', label: 'Erro', statuses: ['error', 'failed', 'crashed'], icon: 'alert' },
+    { key: 'offline', label: 'Offline', statuses: ['offline', 'stopped', 'inactive'], icon: 'radio' },
+  ],
+  sessions: [
+    { key: 'working', label: 'Ativas', statuses: ['active', 'running'], icon: 'zap' },
+    { key: 'waiting', label: 'Aguardando', statuses: ['waiting', 'paused'], icon: 'clock' },
+    { key: 'completed', label: 'Finalizadas', statuses: ['completed', 'done'], icon: 'check' },
+    { key: 'error', label: 'Com Erro', statuses: ['error', 'failed'], icon: 'alert' },
+  ],
+};
+
+function KanbanCard({ item, type }) {
+  const isAgent = type === 'agents';
+  const avatar = isAgent ? (item.avatar || item.id?.slice(0, 2).toUpperCase()) : '💬';
+  const name = isAgent ? item.id : (item.name || item.id?.slice(0, 8));
+  const role = isAgent ? item.role : item.cwd?.split('/').pop() || 'session';
+  const description = isAgent ? item.description : item.lastMessage?.slice(0, 80);
+  const model = item.model || 'claude';
+  const cost = item.cost24h ?? item.cost ?? 0;
+  const currentTool = item.currentTool || item.lastTool;
+
+  return (
+    <div className="hc-kanban-card">
+      <div className="hc-kanban-card-head">
+        <div className="hc-kanban-card-avatar">{avatar}</div>
+        <div className="hc-kanban-card-title">
+          <div className="name">{name}</div>
+          <div className="role">{role}</div>
+        </div>
+      </div>
+      {description && (
+        <div className="hc-kanban-card-body">{description}</div>
+      )}
+      <div className="hc-kanban-card-meta">
+        <span className="model">{model.replace('claude-', '').split('-')[0]}</span>
+        <span className="cost">${cost.toFixed(2)}</span>
+      </div>
+      {currentTool && (
+        <div className="hc-kanban-card-tool">
+          <Icon name="terminal" size={12} stroke={1.75} />
+          <span className="tool-name">{currentTool.name || currentTool}</span>
+          {currentTool.args && (
+            <span className="tool-args">{typeof currentTool.args === 'string' ? currentTool.args : JSON.stringify(currentTool.args).slice(0, 30)}</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KanbanColumn({ column, items, type }) {
+  return (
+    <div className={`hc-kanban-col ${column.key}`}>
+      <div className="hc-kanban-header">
+        <h3>
+          <Icon name={column.icon} size={14} stroke={1.75} />
+          {column.label}
+        </h3>
+        <span className="count">{items.length}</span>
+      </div>
+      <div className="hc-kanban-cards">
+        {items.length === 0 ? (
+          <div className="hc-kanban-empty">
+            <Icon name={column.icon} size={24} stroke={1.5} />
+            <span>Nenhum {type === 'agents' ? 'agente' : 'sessão'}</span>
+          </div>
+        ) : (
+          items.map((item, i) => (
+            <KanbanCard key={item.id || i} item={item} type={type} />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function KanbanPage({ data }) {
+  const [view, setView] = usP('agents');
+  const columns = KANBAN_COLUMNS[view];
+
+  // Agrupa itens por coluna baseado no status
+  const items = view === 'agents' ? data.agents : data.sessions;
+
+  const groupedItems = umP(() => {
+    const groups = {};
+    columns.forEach(col => {
+      groups[col.key] = items.filter(item => {
+        const status = (item.status || 'offline').toLowerCase();
+        return col.statuses.some(s => status.includes(s));
+      });
+    });
+
+    // Itens que não se encaixaram em nenhuma coluna vão para a última
+    const assigned = new Set(Object.values(groups).flat().map(i => i.id));
+    const unassigned = items.filter(i => !assigned.has(i.id));
+    if (unassigned.length > 0) {
+      const lastCol = columns[columns.length - 1].key;
+      groups[lastCol] = [...groups[lastCol], ...unassigned];
+    }
+
+    return groups;
+  }, [items, columns, view]);
+
+  const totalActive = (groupedItems['working']?.length || 0) + (groupedItems['waiting']?.length || 0);
+
+  return (
+    <div className="hc-flex-col" style={{ gap: 16, height: '100%' }}>
+      <div className="hc-flex" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+        <div className="hc-flex" style={{ gap: 12, alignItems: 'center' }}>
+          <div className="hc-kanban-toggle">
+            <button
+              className={view === 'agents' ? 'active' : ''}
+              onClick={() => setView('agents')}
+            >
+              <Icon name="agents" size={12} stroke={1.75} /> Agentes
+            </button>
+            <button
+              className={view === 'sessions' ? 'active' : ''}
+              onClick={() => setView('sessions')}
+            >
+              <Icon name="sessions" size={12} stroke={1.75} /> Sessões
+            </button>
+          </div>
+          <span className="hc-muted" style={{ fontSize: 12 }}>
+            {totalActive} {view === 'agents' ? 'ativos' : 'ativas'} de {items.length}
+          </span>
+        </div>
+        <Tag tone="accent">
+          <Icon name="dot" size={8} /> Live
+        </Tag>
+      </div>
+
+      <div className="hc-kanban">
+        {columns.map(col => (
+          <KanbanColumn
+            key={col.key}
+            column={col}
+            items={groupedItems[col.key] || []}
+            type={view}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 window.Dashboard = Dashboard;
 window.AgentsPage = AgentsPage;
 window.ActivityPage = ActivityPage;
@@ -788,4 +1241,6 @@ window.DoctorPage = DoctorPage;
 window.LogsPage = LogsPage;
 window.SessionsPage = SessionsPage;
 window.TerminalPage = TerminalPage;
+window.LiveExecutionPage = LiveExecutionPage;
+window.KanbanPage = KanbanPage;
 window.PlaceholderPage = PlaceholderPage;

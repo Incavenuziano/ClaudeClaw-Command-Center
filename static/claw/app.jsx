@@ -278,6 +278,7 @@ function App() {
   const Page = (() => {
     switch (active) {
       case 'dashboard':   return <Dashboard data={data} setActive={setActive} />;
+      case 'kanban':      return <KanbanPage data={data} />;
       case 'agents':      return <AgentsPage data={data} />;
       case 'sessions':    return <SessionsPage data={data} />;
       case 'activity':    return <ActivityPage data={data} />;
@@ -290,6 +291,7 @@ function App() {
       case 'doctor':      return <DoctorPage data={data} />;
       case 'logs':        return <LogsPage data={data} />;
       case 'terminal':    return <TerminalPage />;
+      case 'live':        return <LiveExecutionPage data={data} />;
       default:            return <Dashboard data={data} setActive={setActive} />;
     }
   })();

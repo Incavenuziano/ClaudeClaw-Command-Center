@@ -339,13 +339,61 @@ export async function getEvents(): Promise<Event[]> {
   const events: Event[] = [];
 
   try {
-    // Busca últimas observations via MCP claude-mem (server local)
-    // O MCP roda em http://localhost:3456 ou similar
-    // Por enquanto, lê do git log + monitor state como fontes de eventos
+    // 1. Observations do claude-mem (SQLite)
+    const obsQuery = `sqlite3 ~/.claude-mem/claude-mem.db "SELECT id, title, type, created_at FROM observations ORDER BY created_at DESC LIMIT 15" 2>/dev/null`;
+    const obsOutput = execSync(obsQuery, { encoding: "utf-8" });
 
-    // Eventos do git log recente
+    const typeToTone: Record<string, string> = {
+      discovery: "info",
+      bugfix: "warn",
+      feature: "ok",
+      refactor: "info",
+      change: "ok",
+      decision: "info",
+      security_alert: "error",
+      security_note: "warn",
+      session: "ok",
+    };
+
+    const typeToEmoji: Record<string, string> = {
+      discovery: "🔵",
+      bugfix: "🔴",
+      feature: "🟣",
+      refactor: "🔄",
+      change: "✅",
+      decision: "⚖️",
+      security_alert: "🚨",
+      security_note: "🔐",
+      session: "🎯",
+    };
+
+    for (const line of obsOutput.trim().split("\n")) {
+      if (!line) continue;
+      const [id, title, type, created_at] = line.split("|");
+      const date = new Date(created_at);
+      const now = new Date();
+      const diffMs = now.getTime() - date.getTime();
+      const diffMins = Math.floor(diffMs / 60000);
+
+      let timeStr: string;
+      if (diffMins < 1) timeStr = "agora";
+      else if (diffMins < 60) timeStr = `${diffMins}min`;
+      else if (diffMins < 1440) timeStr = `${Math.floor(diffMins / 60)}h`;
+      else timeStr = date.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" });
+
+      events.push({
+        t: timeStr,
+        kind: `obs.${type}`,
+        source: "claude-mem",
+        title: `${typeToEmoji[type] || "📝"} ${title?.slice(0, 55) || ""}`,
+        tone: typeToTone[type] || "ok",
+        detail: `#${id}`,
+      });
+    }
+
+    // 2. Git commits recentes
     const gitLog = execSync(
-      `cd /home/danilo/claudeclaw && git log --oneline --format="%h|%s|%cr" -10 2>/dev/null`,
+      `cd /home/danilo/claudeclaw && git log --oneline --format="%h|%s|%cr" -5 2>/dev/null`,
       { encoding: "utf-8" }
     );
 
@@ -362,13 +410,13 @@ export async function getEvents(): Promise<Event[]> {
       });
     }
 
-    // Eventos do monitor state
+    // 3. Monitor state
     const estado = await getMonitorState();
     if (estado?.ultima_verificacao) {
       const date = new Date(estado.ultima_verificacao);
       const time = date.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", timeZone: "America/Sao_Paulo" });
       const processCount = Object.keys(estado.processos || {}).length;
-      events.unshift({
+      events.push({
         t: time,
         kind: "monitor.run",
         source: "monitor-processos",
@@ -377,9 +425,6 @@ export async function getEvents(): Promise<Event[]> {
         detail: `${processCount} processos consultados`,
       });
     }
-
-    // Ordena por tempo (mais recente primeiro)
-    // Como git log já vem ordenado, só move o monitor pro topo se for mais recente
 
   } catch (err) {
     events.push({
@@ -483,7 +528,31 @@ interface UsageData {
   };
 }
 
+// Cache para evitar scans repetidos
+let lastUsageScan = 0;
+const USAGE_SCAN_INTERVAL_MS = 60 * 60 * 1000; // 60 minutos
+
+async function runUsageScanIfNeeded(): Promise<void> {
+  const now = Date.now();
+  if (now - lastUsageScan < USAGE_SCAN_INTERVAL_MS) {
+    return; // Cache ainda válido
+  }
+
+  try {
+    execSync(`cd /home/danilo/claude-usage && python3 cli.py scan 2>/dev/null`, {
+      encoding: "utf-8",
+      timeout: 30000,
+    });
+    lastUsageScan = now;
+  } catch {
+    // Scan falhou, continua com dados existentes
+  }
+}
+
 export async function getUsage(): Promise<UsageData> {
+  // Roda scan se necessário (cache de 60 min)
+  await runUsageScanIfNeeded();
+
   const usage: UsageData = {
     session: { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0, messages: 0, cost_estimate: 0 },
     today: { tokens: 0, cost: 0, sessions: 0 },

@@ -7,9 +7,48 @@
  *   bun run dashboard/server.ts
  */
 
-import { readFile } from "fs/promises";
+import { readFile, appendFile } from "fs/promises";
 import { join, extname } from "path";
 import { api } from "./api";
+
+// Live Execution State
+interface ExecutionEntry {
+  id: string;
+  timestamp: string;
+  command: string;
+  status: "running" | "completed" | "error";
+  output?: string;
+  exitCode?: number;
+}
+
+const liveExecutions: ExecutionEntry[] = [];
+const MAX_EXECUTIONS = 50;
+const wsClients = new Set<WebSocket>();
+
+function broadcastExecution(entry: ExecutionEntry) {
+  const message = JSON.stringify({ type: "execution", data: entry });
+  for (const client of wsClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    }
+  }
+}
+
+export function registerExecution(entry: ExecutionEntry) {
+  liveExecutions.unshift(entry);
+  if (liveExecutions.length > MAX_EXECUTIONS) {
+    liveExecutions.pop();
+  }
+  broadcastExecution(entry);
+}
+
+export function updateExecution(id: string, updates: Partial<ExecutionEntry>) {
+  const entry = liveExecutions.find(e => e.id === id);
+  if (entry) {
+    Object.assign(entry, updates);
+    broadcastExecution(entry);
+  }
+}
 
 const PORT = 3000;
 const DASHBOARD_DIR = import.meta.dir;
@@ -42,7 +81,26 @@ async function serveFile(path: string): Promise<Response> {
 const server = Bun.serve({
   port: PORT,
   hostname: "0.0.0.0",
-  async fetch(req) {
+
+  // WebSocket handler para Live Execution
+  websocket: {
+    open(ws) {
+      wsClients.add(ws);
+      // Envia histórico recente ao conectar
+      ws.send(JSON.stringify({ type: "history", data: liveExecutions.slice(0, 20) }));
+    },
+    close(ws) {
+      wsClients.delete(ws);
+    },
+    message(ws, message) {
+      // Ping/pong para manter conexão
+      if (message === "ping") {
+        ws.send("pong");
+      }
+    },
+  },
+
+  async fetch(req, server) {
     const url = new URL(req.url);
     let pathname = url.pathname;
 
@@ -136,6 +194,55 @@ const server = Bun.serve({
     // Legacy health endpoint
     if (pathname === "/health/live") {
       return Response.json({ status: "ok" });
+    }
+
+    // WebSocket upgrade para Live Execution
+    if (pathname === "/ws/live") {
+      const upgraded = server.upgrade(req);
+      if (upgraded) {
+        return undefined as unknown as Response;
+      }
+      return new Response("WebSocket upgrade failed", { status: 400 });
+    }
+
+    // API: Listar execuções recentes
+    if (pathname === "/api/executions") {
+      return Response.json(liveExecutions.slice(0, 20));
+    }
+
+    // API: Registrar execução (chamado pelo Claude)
+    if (pathname === "/api/executions/register" && req.method === "POST") {
+      try {
+        const body = await req.json() as ExecutionEntry;
+        if (!body.id || !body.command) {
+          return Response.json({ error: "id e command são obrigatórios" }, { status: 400 });
+        }
+        registerExecution({
+          id: body.id,
+          timestamp: body.timestamp || new Date().toISOString(),
+          command: body.command,
+          status: body.status || "running",
+          output: body.output,
+          exitCode: body.exitCode,
+        });
+        return Response.json({ success: true });
+      } catch {
+        return Response.json({ error: "body inválido" }, { status: 400 });
+      }
+    }
+
+    // API: Atualizar execução
+    if (pathname === "/api/executions/update" && req.method === "POST") {
+      try {
+        const body = await req.json() as { id: string } & Partial<ExecutionEntry>;
+        if (!body.id) {
+          return Response.json({ error: "id é obrigatório" }, { status: 400 });
+        }
+        updateExecution(body.id, body);
+        return Response.json({ success: true });
+      } catch {
+        return Response.json({ error: "body inválido" }, { status: 400 });
+      }
     }
 
     // Fallback para index.html (SPA)
