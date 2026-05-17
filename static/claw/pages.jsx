@@ -6,10 +6,13 @@ const { formatSaoPauloTime } = window.CC_TIME;
 function HealthGauge({ score, size = 100 }) {
   const radius = 42;
   const circumference = 2 * Math.PI * radius;
-  const progress = (score / 100) * circumference;
-  const color = score >= 80 ? 'var(--success)' : score >= 60 ? 'var(--warning)' : 'var(--danger)';
-  const bgColor = score >= 80 ? 'var(--success-bg)' : score >= 60 ? 'var(--warning-bg)' : 'var(--danger-bg)';
-  const label = score >= 80 ? 'Saudável' : score >= 60 ? 'Atenção' : 'Crítico';
+  const isLoading = score === null || score === undefined;
+  const safeScore = isLoading ? 0 : score;
+  const progress = (safeScore / 100) * circumference;
+  const color = isLoading ? 'var(--border-subtle)' : safeScore >= 80 ? 'var(--success)' : safeScore >= 60 ? 'var(--warning)' : 'var(--danger)';
+  const bgColor = isLoading ? 'transparent' : safeScore >= 80 ? 'var(--success-bg)' : safeScore >= 60 ? 'var(--warning-bg)' : 'var(--danger-bg)';
+  const label = isLoading ? '—' : safeScore >= 80 ? 'Saudável' : safeScore >= 60 ? 'Atenção' : 'Crítico';
+  const displayValue = isLoading ? '—' : safeScore;
 
   return (
     <div className="hc-health-gauge" style={{ width: size, height: size }}>
@@ -32,7 +35,7 @@ function HealthGauge({ score, size = 100 }) {
         />
       </svg>
       <div className="hc-health-gauge-inner">
-        <span className="hc-health-gauge-value" style={{ color }}>{score}</span>
+        <span className="hc-health-gauge-value" style={{ color }}>{displayValue}</span>
         <span className="hc-health-gauge-label">{label}</span>
       </div>
     </div>
@@ -40,39 +43,55 @@ function HealthGauge({ score, size = 100 }) {
 }
 
 function calculateHealthScore(data) {
+  // Se ainda não temos dados de satélites OU crons, retorna loading
+  // (evita score=40 fantasma durante refresh / primeiro carregamento)
+  if (!data.satellites?.length || !data.cron?.length) {
+    return { score: null, factors: [], loading: true };
+  }
+
   let score = 0;
   let factors = [];
 
-  // Satellites online (peso 30) — fonte principal de status
   const satsOnline = data.satellites.filter(s => s.status === 'online').length;
-  const satsTotal = data.satellites.length || 1;
+  const satsTotal = data.satellites.length;
   const satScore = (satsOnline / satsTotal) * 30;
   score += satScore;
   if (satScore < 25) factors.push('Satellites offline');
 
-  // Crons sem erro (peso 30)
   const cronsOk = data.cron.filter(c => c.lastStatus !== 'err' && c.last !== 'err').length;
-  const cronsTotal = data.cron.length || 1;
+  const cronsTotal = data.cron.length;
   const cronScore = (cronsOk / cronsTotal) * 30;
   score += cronScore;
   if (cronScore < 25) factors.push('Crons com erro');
 
-  // Custo dentro do limite (peso 20) - assume $50/dia como limite
-  const dailyCost = data.usage?.today?.cost || 0;
-  const costScore = dailyCost <= 50 ? 20 : dailyCost <= 100 ? 12 : 5;
-  score += costScore;
-  if (costScore < 20) factors.push('Custo elevado');
+  // Pressão de uso Max - pior cenário entre janela 5h e semanal (heurística)
+  const rateLimit = data.rateLimit;
+  let capScore = 20;
+  if (rateLimit?.five_hour && rateLimit?.weekly) {
+    const p5h = rateLimit.five_hour.pressure || 0;
+    const pWeek = rateLimit.weekly.pressure || 0;
+    const p = Math.max(p5h, pWeek);
+    capScore = p < 0.5 ? 20 : p < 0.8 ? 12 : 5;
+    if (capScore < 20) {
+      const which = p5h > pWeek ? `5h ${rateLimit.five_hour.pressurePct}%` : `semana ${rateLimit.weekly.pressurePct}%`;
+      factors.push(`Uso ${which}`);
+    }
+  }
+  score += capScore;
 
-  // Sistema respondendo (peso 20)
   const systemOk = data.systemHealth?.version ? 20 : 0;
   score += systemOk;
   if (!systemOk) factors.push('Sistema sem resposta');
 
-  return { score: Math.round(score), factors };
+  return { score: Math.round(score), factors, loading: false };
 }
 
 function Dashboard({ data, setActive }) {
-  const health = umP(() => calculateHealthScore(data), [data]);
+  // Recalcula quando as fontes mudam de tamanho ou custo muda (data é referência estável)
+  const health = umP(
+    () => calculateHealthScore(data),
+    [data.satellites?.length, data.cron?.length, data.rateLimit?.five_hour?.pressurePct, data.rateLimit?.weekly?.pressurePct]
+  );
 
   return (
     <div className="hc-flex-col" style={{ gap: 16 }}>
@@ -89,7 +108,14 @@ function Dashboard({ data, setActive }) {
         <Stat label="Agentes" value={data.agents.filter(a=>a.status==='online'||a.status==='active').length + ' / ' + data.agents.length} icon="agents" spark={[2,3,3,4,4,4,5,4,4,5,5,6]} />
         <Stat label="Sessões" value={data.sessions.filter(s=>s.status==='active').length} icon="sessions" spark={[1,1,1,2,2,1,1,2,2,2,2,2]} />
         <Stat label="Tokens hoje" value={(data.usage.today.tokens/1000).toFixed(1) + 'k'} icon="zap" spark={data.usage.hourly.slice(-12)} />
-        <Stat label="Custo hoje" value={'$' + data.usage.today.cost.toFixed(2)} delta={data.usage.week?.cost ? `$${data.usage.week.cost.toFixed(0)} semana` : ''} icon="usage" spark={data.usage.hourly.slice(-12).map(v => v * 0.008)} />
+        <Stat
+          label="Capacidade Max"
+          value={data.rateLimit?.five_hour ? `${data.rateLimit.five_hour.pressurePct}% / ${data.rateLimit.weekly.pressurePct}%` : '—'}
+          delta={data.rateLimit?.five_hour ? `5h · semana` : 'carregando…'}
+          deltaSub="reseta qua 7h"
+          icon="zap"
+          spark={data.usage.hourly.slice(-12)}
+        />
       </div>
 
       <div className="hc-grid hc-grid-2-1">
@@ -408,6 +434,38 @@ function CostBreakdownChart({ agents, satellites }) {
   );
 }
 
+function ProjectUsageBreakdown({ data }) {
+  if (!data || !data.projects || data.projects.length === 0) {
+    return (
+      <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-muted)' }}>
+        Sem dados de uso nas últimas 5h
+      </div>
+    );
+  }
+  const totalM = (data.totalTokens / 1_000_000).toFixed(2);
+  return (
+    <div className="hc-flex-col" style={{ gap: 10 }}>
+      <div className="hc-meta-line">total: <b>{totalM}M tokens</b> · {data.projects.reduce((s, p) => s + p.turns, 0)} turns</div>
+      {data.projects.map(p => (
+        <div key={p.project} className="hc-flex-col" style={{ gap: 4 }}>
+          <div className="hc-flex-row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+            <span className="hc-text-primary" style={{ fontSize: 13 }}>{p.project}</span>
+            <span className="hc-mono hc-meta-line">{(p.tokens/1_000_000).toFixed(2)}M · {p.pctOfTotal}%</span>
+          </div>
+          <div style={{ height: 6, background: 'var(--border-subtle)', borderRadius: 3, overflow: 'hidden' }}>
+            <div style={{
+              width: `${p.pctOfTotal}%`,
+              height: '100%',
+              background: p.pctOfTotal > 50 ? 'var(--warning)' : 'var(--success)',
+              transition: 'width 0.4s ease'
+            }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function UsagePage({ data }) {
   const week = data.usage.week || { cost: 0, daily: [] };
   const daily = week.daily || [];
@@ -422,10 +480,22 @@ function UsagePage({ data }) {
   return (
     <div className="hc-flex-col" style={{ gap: 16 }}>
       <div className="hc-grid hc-grid-4">
-        <Stat label="Tokens hoje" value={(data.usage.today.tokens/1000).toFixed(1) + 'k'} icon="zap" />
-        <Stat label="Custo hoje" value={'$' + data.usage.today.cost.toFixed(2)} icon="usage" />
-        <Stat label="Custo semana" value={'$' + (week.cost || 0).toFixed(2)} icon="trending" />
-        <Stat label="Sessões hoje" value={data.usage.today.sessions} icon="sessions" />
+        <Stat label="Tokens hoje" value={(data.usage.today.tokens/1000).toFixed(1) + 'k'} icon="zap" deltaSub="" />
+        <Stat
+          label="Capacidade 5h"
+          value={data.rateLimit?.five_hour ? `${data.rateLimit.five_hour.pressurePct}%` : '—'}
+          delta={data.rateLimit?.five_hour ? `${(data.rateLimit.five_hour.tokens/1_000_000).toFixed(2)}M / ${(data.rateLimit.five_hour.limit/1_000_000).toFixed(0)}M` : ''}
+          deltaSub="janela rolante"
+          icon="zap"
+        />
+        <Stat
+          label="Capacidade semanal"
+          value={data.rateLimit?.weekly ? `${data.rateLimit.weekly.pressurePct}%` : '—'}
+          delta={data.rateLimit?.weekly ? `${(data.rateLimit.weekly.tokens/1_000_000).toFixed(1)}M / ${(data.rateLimit.weekly.limit/1_000_000).toFixed(0)}M` : ''}
+          deltaSub="reseta qua 7h"
+          icon="trending"
+        />
+        <Stat label="Sessões hoje" value={data.usage.today.sessions} icon="sessions" deltaSub="" />
       </div>
 
       <div className="hc-grid hc-grid-2">
@@ -446,8 +516,8 @@ function UsagePage({ data }) {
           </div>
         </Panel>
 
-        <Panel title="Breakdown por Agente" icon="agents" sub="custo 24h">
-          <CostBreakdownChart agents={data.agents} satellites={data.satellites} />
+        <Panel title="Consumo por projeto" icon="agents" sub="últimas 5h">
+          <ProjectUsageBreakdown data={data.usageByProject} />
         </Panel>
       </div>
 
@@ -462,23 +532,20 @@ function UsagePage({ data }) {
           </dl>
         </Panel>
 
-        <Panel title="Consumo detalhado" icon="database">
+        <Panel title="Consumo detalhado" icon="database" sub="projeto · 5h">
           <table className="hc-tbl">
-            <thead><tr><th>Agente</th><th className="col-r">Tokens</th><th className="col-r">Custo</th><th className="col-r">%</th></tr></thead>
+            <thead><tr><th>Projeto</th><th className="col-r">Turns</th><th className="col-r">Tokens</th><th className="col-r">% 5h</th></tr></thead>
             <tbody>
-              {data.agents.filter(a => a.cost24h > 0 || a.tokens24h > 0).map(a => {
-                const totalCost = data.agents.reduce((sum, ag) => sum + (ag.cost24h || 0), 0) || 1;
-                return (
-                  <tr key={a.id}>
-                    <td className="hc-text-primary">{a.id}</td>
-                    <td className="mono col-r">{(a.tokens24h/1000).toFixed(1)}k</td>
-                    <td className="mono col-r">${a.cost24h.toFixed(2)}</td>
-                    <td className="mono col-r">{((a.cost24h / totalCost) * 100).toFixed(0)}%</td>
-                  </tr>
-                );
-              })}
-              {data.agents.filter(a => a.cost24h > 0 || a.tokens24h > 0).length === 0 && (
-                <tr><td colSpan="4" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 16 }}>Sem consumo registrado</td></tr>
+              {(data.usageByProject?.projects || []).map(p => (
+                <tr key={p.project}>
+                  <td className="hc-text-primary">{p.project}</td>
+                  <td className="mono col-r">{p.turns}</td>
+                  <td className="mono col-r">{(p.tokens/1_000_000).toFixed(2)}M</td>
+                  <td className="mono col-r">{p.pctOfTotal}%</td>
+                </tr>
+              ))}
+              {(!data.usageByProject?.projects || data.usageByProject.projects.length === 0) && (
+                <tr><td colSpan="4" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 16 }}>Sem dados nas últimas 5h</td></tr>
               )}
             </tbody>
           </table>

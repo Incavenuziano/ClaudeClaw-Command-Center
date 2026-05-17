@@ -1,7 +1,9 @@
 /* ClaudeClaw Command Center — Reusable primitives */
 const { useState: useStateP, useEffect: useEffectP, useMemo: useMemoP } = React;
 
-function Stat({ label, value, delta, deltaDir, icon, spark }) {
+function Stat({ label, value, delta, deltaDir, deltaSub, icon, spark }) {
+  // deltaSub: texto pequeno após o delta. Default = "vs ontem". Passe "" pra esconder.
+  const subtitle = deltaSub === undefined ? 'vs ontem' : deltaSub;
   return (
     <div className="hc-stat">
       <div className="hc-stat-head">
@@ -12,7 +14,7 @@ function Stat({ label, value, delta, deltaDir, icon, spark }) {
       {delta && (
         <div className="hc-stat-meta">
           <span className={deltaDir === 'up' ? 'up' : deltaDir === 'down' ? 'down' : ''}>{delta}</span>
-          <span className="hc-muted">vs ontem</span>
+          {subtitle && <span className="hc-muted">{subtitle}</span>}
         </div>
       )}
       {spark && <Sparkline className="hc-stat-spark" values={spark} />}

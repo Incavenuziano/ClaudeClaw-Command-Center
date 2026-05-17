@@ -1106,6 +1106,163 @@ async function getTelegramTranscript(limit = 50): Promise<TranscriptMessage[]> {
   return messages;
 }
 
+interface RateLimitWindow {
+  tokens: number;
+  limit: number;
+  pressure: number;     // 0-1
+  pressurePct: number;  // 0-100
+  status: "ok" | "warning" | "critical";
+  resetAt: string;      // ISO timestamp da próxima reset
+}
+
+interface RateLimitInfo {
+  tier: string;
+  five_hour: RateLimitWindow;
+  weekly: RateLimitWindow;
+  source: "estimate";  // calibrado com dados da Anthropic em 2026-05-17
+}
+
+// Calibrado em 2026-05-17 com Danilo: 1.26M = 24% (5h), 15.1M = 11% (semana)
+const TIER_LIMITS: Record<string, { fiveHour: number; weekly: number }> = {
+  "default_claude_pro":    { fiveHour: 1_000_000,   weekly: 30_000_000  },
+  "default_claude_max_5x": { fiveHour: 5_200_000,   weekly: 137_000_000 },
+  "default_claude_max_20x":{ fiveHour: 20_800_000,  weekly: 548_000_000 },
+};
+
+function statusFromPressure(p: number): "ok" | "warning" | "critical" {
+  return p < 0.5 ? "ok" : p < 0.8 ? "warning" : "critical";
+}
+
+function nextWedAt7h(): Date {
+  const now = new Date();
+  // weekday: 0=Sun ... 3=Wed
+  const daysUntilWed = (3 - now.getDay() + 7) % 7 || 7;
+  const next = new Date(now);
+  next.setDate(now.getDate() + daysUntilWed);
+  next.setHours(7, 0, 0, 0);
+  // se hoje é quarta antes das 7h, próxima reset é hoje
+  if (now.getDay() === 3 && now.getHours() < 7) {
+    next.setDate(now.getDate());
+  }
+  return next;
+}
+
+function lastWedAt7h(): Date {
+  const now = new Date();
+  const daysSinceWed = (now.getDay() - 3 + 7) % 7;
+  const last = new Date(now);
+  last.setDate(now.getDate() - daysSinceWed);
+  last.setHours(7, 0, 0, 0);
+  if (last > now) last.setDate(last.getDate() - 7);
+  return last;
+}
+
+export async function getRateLimit(): Promise<RateLimitInfo> {
+  let tier = "default_claude_max_5x";
+  try {
+    const credsRaw = await readFile("/home/danilo/.claude/.credentials.json", "utf-8");
+    const creds = JSON.parse(credsRaw);
+    tier = creds?.claudeAiOauth?.rateLimitTier || tier;
+  } catch {}
+
+  const limits = TIER_LIMITS[tier] || TIER_LIMITS["default_claude_max_5x"];
+
+  function countTokens(sinceClause: string): number {
+    // Anthropic não documenta a fórmula exata para rate limit.
+    // Calibrado com Danilo em 2026-05-17: input + output + 0.8*cache_creation
+    // bate aproximadamente com o painel oficial (±5pp).
+    try {
+      const out = execSync(
+        `sqlite3 /home/danilo/.claude/usage.db "SELECT COALESCE(ROUND(SUM(input_tokens) + SUM(output_tokens) + SUM(cache_creation_tokens) * 0.8), 0) FROM turns WHERE datetime(timestamp) > ${sinceClause}"`,
+        { encoding: "utf-8", timeout: 5000 }
+      );
+      return Math.round(parseFloat(out.trim())) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  const tokens5h = countTokens(`datetime('now', '-5 hours')`);
+  const lastWed = lastWedAt7h();
+  const weekStart = lastWed.toISOString().replace("T", " ").substring(0, 19);
+  const tokensWeek = countTokens(`datetime('${weekStart}')`);
+
+  const p5h = Math.min(1, tokens5h / limits.fiveHour);
+  const pWeek = Math.min(1, tokensWeek / limits.weekly);
+
+  // Próxima reset 5h: agora + 5h (rolling window — heurística)
+  const fiveHourReset = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
+  const weeklyReset = nextWedAt7h().toISOString();
+
+  return {
+    tier,
+    five_hour: {
+      tokens: tokens5h,
+      limit: limits.fiveHour,
+      pressure: p5h,
+      pressurePct: Math.round(p5h * 100),
+      status: statusFromPressure(p5h),
+      resetAt: fiveHourReset,
+    },
+    weekly: {
+      tokens: tokensWeek,
+      limit: limits.weekly,
+      pressure: pWeek,
+      pressurePct: Math.round(pWeek * 100),
+      status: statusFromPressure(pWeek),
+      resetAt: weeklyReset,
+    },
+    source: "estimate",
+  };
+}
+
+interface ProjectUsage {
+  project: string;       // ex: "claudeclaw", "claudeclaw/dashboard", "claude-mem/observer"
+  turns: number;
+  tokens: number;        // input + output + 0.8*cache_creation (mesma fórmula do rate-limit)
+  pctOfTotal: number;    // % da janela 5h
+}
+
+export async function getUsageByProject(): Promise<{ window: "5h"; projects: ProjectUsage[]; totalTokens: number }> {
+  const query = `SELECT
+    COALESCE(NULLIF(cwd, ''), 'unknown') AS proj,
+    COUNT(*) as turns,
+    ROUND(SUM(input_tokens) + SUM(output_tokens) + SUM(cache_creation_tokens) * 0.8) AS tokens
+  FROM turns
+  WHERE datetime(timestamp) > datetime('now', '-5 hours')
+  GROUP BY proj
+  ORDER BY tokens DESC`;
+
+  let projects: ProjectUsage[] = [];
+  let totalTokens = 0;
+  try {
+    const out = execSync(
+      `sqlite3 -json /home/danilo/.claude/usage.db "${query}"`,
+      { encoding: "utf-8", timeout: 5000 }
+    );
+    const rows = JSON.parse(out || "[]") as Array<{ proj: string; turns: number; tokens: number }>;
+    totalTokens = rows.reduce((s, r) => s + (r.tokens || 0), 0) || 1;
+    projects = rows.map(r => ({
+      project: friendlyProjectName(r.proj),
+      turns: r.turns,
+      tokens: r.tokens || 0,
+      pctOfTotal: Math.round(((r.tokens || 0) / totalTokens) * 100),
+    }));
+  } catch {}
+
+  return { window: "5h", projects, totalTokens };
+}
+
+function friendlyProjectName(cwd: string): string {
+  if (!cwd || cwd === "unknown") return "desconhecido";
+  // Normaliza path → nome curto
+  const norm = cwd.replace(/^\/home\/[^/]+\//, "").replace(/^\.claude-mem\//, "claude-mem/");
+  if (norm.includes("observer-sessions")) return "claude-mem (observer)";
+  if (norm === "claudeclaw") return "claudeclaw (principal)";
+  if (norm === "claudeclaw/dashboard") return "claudeclaw (dashboard)";
+  return norm;
+}
+
 // Export all API functions
 export const api = {
   getProcessos,
@@ -1116,6 +1273,8 @@ export const api = {
   getEvents,
   getLogs,
   getUsage,
+  getRateLimit,
+  getUsageByProject,
   execCommand,
   getPncp,
   sendToSatellite,

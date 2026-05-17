@@ -104,6 +104,8 @@ let doctor = [];
 let satellites = [];
 let monitorState = null;
 let pncp = { ultima_atualizacao: null, licitacoes: [] };
+let rateLimit = null;
+let usageByProject = null;
 
 // Estado de loading e callbacks
 let isRefreshing = false;
@@ -123,7 +125,7 @@ async function fetchRealData() {
   notifyListeners({ refreshing: true, lastRefresh });
 
   try {
-    const [processosRes, cronsRes, doctorRes, satellitesRes, monitorRes, eventsRes, logsRes, usageRes, pncpRes] = await Promise.all([
+    const [processosRes, cronsRes, doctorRes, satellitesRes, monitorRes, eventsRes, logsRes, usageRes, pncpRes, rateLimitRes, usageByProjRes] = await Promise.all([
       fetch('/api/processos').then(r => r.json()).catch(() => []),
       fetch('/api/crons').then(r => r.json()).catch(() => []),
       fetch('/api/doctor').then(r => r.json()).catch(() => []),
@@ -133,6 +135,8 @@ async function fetchRealData() {
       fetch('/api/logs').then(r => r.json()).catch(() => []),
       fetch('/api/usage').then(r => r.json()).catch(() => null),
       fetch('/api/pncp').then(r => r.json()).catch(() => ({ ultima_atualizacao: null, licitacoes: [] })),
+      fetch('/api/rate-limit').then(r => r.json()).catch(() => null),
+      fetch('/api/usage-by-project').then(r => r.json()).catch(() => null),
     ]);
 
     // Processos
@@ -213,6 +217,12 @@ async function fetchRealData() {
     // PNCP
     pncp = pncpRes || { ultima_atualizacao: null, licitacoes: [] };
 
+    // Rate limit (estimativa Max plan)
+    rateLimit = rateLimitRes;
+
+    // Breakdown de uso por projeto/cwd (janela 5h)
+    usageByProject = usageByProjRes;
+
     console.log('[CC] Dados reais carregados:', {
       processos: processos.length,
       crons: cron.length,
@@ -265,6 +275,8 @@ window.CC_DATA = {
   get satellites() { return satellites; },
   get monitorState() { return monitorState; },
   get pncp() { return pncp; },
+  get rateLimit() { return rateLimit; },
+  get usageByProject() { return usageByProject; },
   get isRefreshing() { return isRefreshing; },
   get lastRefresh() { return lastRefresh; },
   refresh: fetchRealData,

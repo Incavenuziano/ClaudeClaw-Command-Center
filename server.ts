@@ -160,6 +160,16 @@ const server = Bun.serve({
       return Response.json(data);
     }
 
+    if (pathname === "/api/rate-limit") {
+      const data = await api.getRateLimit();
+      return Response.json(data);
+    }
+
+    if (pathname === "/api/usage-by-project") {
+      const data = await api.getUsageByProject();
+      return Response.json(data);
+    }
+
     if (pathname === "/api/exec" && req.method === "POST") {
       try {
         const body = await req.json() as { command?: string };
