@@ -876,6 +876,236 @@ export async function sendToSatellite(satelliteId: string, message: string): Pro
   }
 }
 
+// Session transcripts
+const CLAUDE_PROJECTS_DIR = "/home/danilo/.claude/projects";
+const AGENTS_DIR = "/home/danilo/claudeclaw/agents";
+
+interface SessionInfo {
+  id: string;
+  agent: string;
+  threadId?: string;
+  chatId?: number;
+  lastActivity: string;
+  turnCount: number;
+  sessionPath?: string;
+}
+
+interface TranscriptMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+  timestamp?: string;
+}
+
+export async function getSessions(): Promise<SessionInfo[]> {
+  const sessions: SessionInfo[] = [];
+
+  // Busca sessions dos satellites (adv, araticum, designer)
+  const agents = ["adv", "araticum", "designer"];
+
+  for (const agent of agents) {
+    try {
+      // Verifica sessions.json do Agent SDK
+      const sessionsFile = join(AGENTS_DIR, agent, "sessions.json");
+      try {
+        const content = await readFile(sessionsFile, "utf-8");
+        const data = JSON.parse(content);
+        if (data.threads) {
+          for (const [threadId, thread] of Object.entries(data.threads) as [string, any][]) {
+            sessions.push({
+              id: thread.sessionId,
+              agent,
+              threadId,
+              lastActivity: thread.lastUsedAt || thread.createdAt,
+              turnCount: thread.turnCount || 0,
+            });
+          }
+        }
+      } catch {}
+
+      // Verifica sessions por chatId
+      const sessionsDir = join(AGENTS_DIR, agent, "sessions");
+      try {
+        const files = await readdir(sessionsDir);
+        for (const file of files) {
+          if (!file.endsWith(".json")) continue;
+          const chatId = parseInt(file.replace(".json", ""));
+          if (isNaN(chatId)) continue;
+
+          const content = await readFile(join(sessionsDir, file), "utf-8");
+          const data = JSON.parse(content);
+
+          // Evita duplicatas
+          if (!sessions.find(s => s.id === data.sessionId)) {
+            sessions.push({
+              id: data.sessionId,
+              agent,
+              chatId,
+              lastActivity: new Date(data.lastActivity).toISOString(),
+              turnCount: 0,
+            });
+          }
+        }
+      } catch {}
+    } catch {}
+  }
+
+  // Adiciona sessão do ClaudeClaw daemon (Telegram logs)
+  try {
+    const claudeclawLogsDir = "/home/danilo/claudeclaw/.claude/claudeclaw/logs";
+    const sessionFile = "/home/danilo/claudeclaw/.claude/claudeclaw/session.json";
+
+    const sessionData = JSON.parse(await readFile(sessionFile, "utf-8"));
+
+    // Conta logs do telegram
+    const logFiles = await readdir(claudeclawLogsDir);
+    const telegramLogs = logFiles.filter(f => f.startsWith("telegram-") && f.endsWith(".log"));
+
+    sessions.push({
+      id: sessionData.sessionId,
+      agent: "claudeclaw",
+      threadId: "telegram",
+      lastActivity: sessionData.lastUsedAt || sessionData.createdAt,
+      turnCount: telegramLogs.length,
+    });
+  } catch {}
+
+  // Ordena por última atividade
+  sessions.sort((a, b) => new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime());
+
+  return sessions;
+}
+
+export async function getSessionTranscript(sessionId: string, limit = 50): Promise<TranscriptMessage[]> {
+  const messages: TranscriptMessage[] = [];
+
+  // Verifica se é sessão do ClaudeClaw daemon (telegram logs)
+  const claudeclawSessionFile = "/home/danilo/claudeclaw/.claude/claudeclaw/session.json";
+  try {
+    const sessionData = JSON.parse(await readFile(claudeclawSessionFile, "utf-8"));
+    if (sessionData.sessionId === sessionId) {
+      // Lê logs do Telegram
+      return await getTelegramTranscript(limit);
+    }
+  } catch {}
+
+  // Busca o JSONL da sessão nos projetos Claude
+  try {
+    const projectDirs = await readdir(CLAUDE_PROJECTS_DIR);
+
+    for (const projectDir of projectDirs) {
+      const projectPath = join(CLAUDE_PROJECTS_DIR, projectDir);
+      const projectStat = await stat(projectPath);
+      if (!projectStat.isDirectory()) continue;
+
+      // Verifica se tem o arquivo da sessão
+      const jsonlPath = join(projectPath, `${sessionId}.jsonl`);
+      try {
+        const content = await readFile(jsonlPath, "utf-8");
+        const lines = content.trim().split("\n").filter(l => l);
+
+        for (const line of lines.slice(-limit * 2)) {
+          try {
+            const entry = JSON.parse(line);
+
+            // Formato varia, mas geralmente tem type/role
+            if (entry.type === "human" || entry.role === "user") {
+              const text = entry.message?.content || entry.content || entry.text || "";
+              if (text) {
+                messages.push({
+                  role: "user",
+                  content: typeof text === "string" ? text : JSON.stringify(text),
+                  timestamp: entry.timestamp || entry.createdAt,
+                });
+              }
+            } else if (entry.type === "assistant" || entry.role === "assistant") {
+              const text = entry.message?.content || entry.content || entry.text || "";
+              if (text) {
+                messages.push({
+                  role: "assistant",
+                  content: typeof text === "string" ? text : JSON.stringify(text),
+                  timestamp: entry.timestamp || entry.createdAt,
+                });
+              }
+            }
+          } catch {}
+        }
+
+        if (messages.length > 0) break;
+      } catch {}
+    }
+  } catch {}
+
+  return messages.slice(-limit);
+}
+
+async function getTelegramTranscript(limit = 50): Promise<TranscriptMessage[]> {
+  const messages: TranscriptMessage[] = [];
+  const logsDir = "/home/danilo/claudeclaw/.claude/claudeclaw/logs";
+
+  try {
+    const files = await readdir(logsDir);
+    const telegramLogs = files
+      .filter(f => f.startsWith("telegram-") && f.endsWith(".log"))
+      .sort()
+      .reverse()
+      .slice(0, limit);
+
+    for (const file of telegramLogs.reverse()) {
+      try {
+        const content = await readFile(join(logsDir, file), "utf-8");
+        const lines = content.split("\n");
+
+        // Parse do formato de log
+        let timestamp = "";
+        let userMessage = "";
+        let assistantMessage = "";
+        let inOutput = false;
+
+        for (const line of lines) {
+          if (line.startsWith("Date: ")) {
+            timestamp = line.replace("Date: ", "").trim();
+          } else if (line.startsWith("Prompt: ")) {
+            // Próximas linhas até "Exit code" são a mensagem do usuário
+            const idx = lines.indexOf(line);
+            const promptLines: string[] = [];
+            for (let i = idx; i < lines.length; i++) {
+              if (lines[i].startsWith("Exit code:")) break;
+              if (lines[i].startsWith("## Output")) break;
+              if (i > idx) promptLines.push(lines[i]);
+            }
+            userMessage = promptLines.join("\n").trim();
+            // Remove prefixo [Telegram from ...]
+            const match = userMessage.match(/Message: ([\s\S]*)/);
+            if (match) userMessage = match[1].trim();
+          } else if (line.startsWith("## Output")) {
+            inOutput = true;
+          } else if (inOutput) {
+            assistantMessage += line + "\n";
+          }
+        }
+
+        if (userMessage) {
+          messages.push({
+            role: "user",
+            content: userMessage,
+            timestamp,
+          });
+        }
+
+        if (assistantMessage.trim()) {
+          messages.push({
+            role: "assistant",
+            content: assistantMessage.trim(),
+            timestamp,
+          });
+        }
+      } catch {}
+    }
+  } catch {}
+
+  return messages;
+}
+
 // Export all API functions
 export const api = {
   getProcessos,
@@ -889,4 +1119,6 @@ export const api = {
   execCommand,
   getPncp,
   sendToSatellite,
+  getSessions,
+  getSessionTranscript,
 };

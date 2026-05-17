@@ -205,6 +205,18 @@ const server = Bun.serve({
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
 
+    // API: Listar sessões
+    if (pathname === "/api/sessions") {
+      return Response.json(await api.getSessions());
+    }
+
+    // API: Transcript de uma sessão
+    if (pathname.startsWith("/api/sessions/") && pathname.endsWith("/transcript")) {
+      const sessionId = pathname.replace("/api/sessions/", "").replace("/transcript", "");
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      return Response.json(await api.getSessionTranscript(sessionId, limit));
+    }
+
     // API: Listar execuções recentes
     if (pathname === "/api/executions") {
       return Response.json(liveExecutions.slice(0, 20));

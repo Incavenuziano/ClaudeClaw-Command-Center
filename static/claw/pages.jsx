@@ -40,39 +40,33 @@ function HealthGauge({ score, size = 100 }) {
 }
 
 function calculateHealthScore(data) {
-  let score = 100;
+  let score = 0;
   let factors = [];
 
-  // Agentes online (peso 25)
-  const agentsOnline = data.agents.filter(a => a.status === 'online' || a.status === 'active').length;
-  const agentsTotal = data.agents.length || 1;
-  const agentScore = (agentsOnline / agentsTotal) * 25;
-  score = agentScore;
-  if (agentScore < 20) factors.push('Poucos agentes ativos');
-
-  // Satellites online (peso 20)
+  // Satellites online (peso 30) — fonte principal de status
   const satsOnline = data.satellites.filter(s => s.status === 'online').length;
   const satsTotal = data.satellites.length || 1;
-  const satScore = (satsOnline / satsTotal) * 20;
+  const satScore = (satsOnline / satsTotal) * 30;
   score += satScore;
-  if (satScore < 15) factors.push('Satellites offline');
+  if (satScore < 25) factors.push('Satellites offline');
 
-  // Crons sem erro (peso 25)
-  const cronsOk = data.cron.filter(c => c.last !== 'err').length;
+  // Crons sem erro (peso 30)
+  const cronsOk = data.cron.filter(c => c.lastStatus !== 'err' && c.last !== 'err').length;
   const cronsTotal = data.cron.length || 1;
-  const cronScore = (cronsOk / cronsTotal) * 25;
+  const cronScore = (cronsOk / cronsTotal) * 30;
   score += cronScore;
-  if (cronScore < 20) factors.push('Crons com erro');
+  if (cronScore < 25) factors.push('Crons com erro');
 
-  // Custo dentro do limite (peso 15) - assume $50/dia como limite
+  // Custo dentro do limite (peso 20) - assume $50/dia como limite
   const dailyCost = data.usage?.today?.cost || 0;
-  const costScore = dailyCost <= 50 ? 15 : dailyCost <= 100 ? 10 : 5;
+  const costScore = dailyCost <= 50 ? 20 : dailyCost <= 100 ? 12 : 5;
   score += costScore;
-  if (costScore < 15) factors.push('Custo elevado');
+  if (costScore < 20) factors.push('Custo elevado');
 
-  // Sistema respondendo (peso 15)
-  const systemOk = data.systemHealth?.version ? 15 : 0;
+  // Sistema respondendo (peso 20)
+  const systemOk = data.systemHealth?.version ? 20 : 0;
   score += systemOk;
+  if (!systemOk) factors.push('Sistema sem resposta');
 
   return { score: Math.round(score), factors };
 }
@@ -167,42 +161,159 @@ function Dashboard({ data, setActive }) {
   );
 }
 
-function AgentsPage({ data }) {
-  const [sel, setSel] = usP(data.agents[0]);
+function AgentSlideout({ agent, onClose, data }) {
+  const [tab, setTab] = usP('info');
+
+  // Encontra satellite correspondente
+  const satellite = data.satellites.find(s => s.id === agent.id || agent.id.includes(s.id));
+
+  // Logs recentes do agente (filtra por nome)
+  const agentLogs = data.logs.filter(l =>
+    l.source?.toLowerCase().includes(agent.id.toLowerCase()) ||
+    l.message?.toLowerCase().includes(agent.id.toLowerCase())
+  ).slice(0, 10);
+
+  // Sessões do agente
+  const agentSessions = data.sessions.filter(s => s.agent === agent.id);
+
   return (
-    <div className="hc-split">
-      <Panel title="Agentes" icon="agents" sub={`${data.agents.length} registrados`} className="hc-split-list">
-        <div style={{ margin: -14 }}>
-          {data.agents.map(a => (
-            <div key={a.id} className={`hc-row ${sel?.id === a.id ? 'selected' : ''}`} onClick={() => setSel(a)}>
-              <div className="hc-agent-avatar">{a.avatar}<span className={`dot ${agentStatusTone(a.status)}`} /></div>
-              <div className="hc-grow">
-                <div className="hc-text-primary" style={{ fontSize: 13, fontWeight: 500 }}>{a.id}</div>
-                <div className="hc-meta-line">{a.role} · {a.model}</div>
-              </div>
-              <Tag tone={agentStatusTone(a.status)}>{a.status}</Tag>
+    <div className="hc-slideout-backdrop" onClick={onClose}>
+      <div className="hc-slideout" onClick={e => e.stopPropagation()}>
+        <div className="hc-slideout-header">
+          <div className="hc-slideout-title">
+            <div className="hc-agent-avatar lg">{agent.avatar}<span className={`dot ${agentStatusTone(agent.status)}`} /></div>
+            <div>
+              <h2>{agent.id}</h2>
+              <span className="hc-text-sec">{agent.role} · {agent.model}</span>
             </div>
+          </div>
+          <button className="hc-btn sm ghost" onClick={onClose}><Icon name="x" size={16} /></button>
+        </div>
+
+        <div className="hc-slideout-tabs">
+          {['info', 'logs', 'sessões'].map(t => (
+            <button key={t} className={tab === t ? 'active' : ''} onClick={() => setTab(t)}>
+              {t.charAt(0).toUpperCase() + t.slice(1)}
+            </button>
           ))}
         </div>
-      </Panel>
 
-      {sel && (
-        <Panel title={sel.id} icon="agents" sub={sel.role} className="hc-split-detail">
-          <div className="hc-grid hc-grid-2" style={{ marginBottom: 14 }}>
-            <Stat label="Tokens 24h" value={(sel.tokens24h/1000).toFixed(1) + 'k'} />
-            <Stat label="Custo 24h" value={'$' + sel.cost24h.toFixed(2)} />
+        <div className="hc-slideout-body">
+          {tab === 'info' && (
+            <>
+              <div className="hc-grid hc-grid-2" style={{ marginBottom: 16 }}>
+                <div className="hc-stat-card">
+                  <span className="hc-stat-value">{(agent.tokens24h/1000).toFixed(1)}k</span>
+                  <span className="hc-stat-label">Tokens 24h</span>
+                </div>
+                <div className="hc-stat-card">
+                  <span className="hc-stat-value">${agent.cost24h.toFixed(2)}</span>
+                  <span className="hc-stat-label">Custo 24h</span>
+                </div>
+              </div>
+
+              <dl className="hc-kv">
+                <dt>Status</dt><dd><Tag tone={agentStatusTone(agent.status)}>{agent.status}</Tag></dd>
+                <dt>Modelo</dt><dd className="hc-mono">{agent.model}</dd>
+                <dt>Tipo</dt><dd>{agent.role}</dd>
+                <dt>Sessões ativas</dt><dd className="hc-mono">{agent.sessions}</dd>
+                <dt>Última atividade</dt><dd className="hc-mono">{agent.lastSeen}</dd>
+                {satellite && <>
+                  <dt>Bot Telegram</dt><dd className="hc-mono">{satellite.bot}</dd>
+                </>}
+              </dl>
+
+              <div className="hc-divider" />
+              <h4 style={{ marginBottom: 8 }}>Descrição</h4>
+              <p className="hc-text-sec" style={{ fontSize: 13, lineHeight: 1.5 }}>{agent.description}</p>
+            </>
+          )}
+
+          {tab === 'logs' && (
+            <div className="hc-slideout-logs">
+              {agentLogs.length === 0 ? (
+                <div className="hc-empty">
+                  <Icon name="logs" size={24} />
+                  <span>Sem logs recentes</span>
+                </div>
+              ) : (
+                agentLogs.map((l, i) => (
+                  <div key={i} className="hc-log-row">
+                    <span className="hc-log-time">{l.time}</span>
+                    <Tag tone={l.level === 'error' ? 'err' : l.level === 'warn' ? 'warn' : 'ok'} style={{ fontSize: 10 }}>{l.level}</Tag>
+                    <span className="hc-log-msg">{l.message}</span>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {tab === 'sessões' && (
+            <div className="hc-slideout-sessions">
+              {agentSessions.length === 0 ? (
+                <div className="hc-empty">
+                  <Icon name="sessions" size={24} />
+                  <span>Sem sessões ativas</span>
+                </div>
+              ) : (
+                agentSessions.map(s => (
+                  <div key={s.id} className="hc-row">
+                    <Icon name="chat" size={14} />
+                    <div className="hc-grow">
+                      <div className="hc-text-primary" style={{ fontSize: 13 }}>{s.title || s.id}</div>
+                      <div className="hc-meta-line">{s.platform} · {s.started}</div>
+                    </div>
+                    <Tag tone={s.status === 'active' ? 'ok' : 'muted'}>{s.status}</Tag>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AgentsPage({ data }) {
+  const [sel, setSel] = usP(null);
+  const [slideout, setSlideout] = usP(null);
+
+  return (
+    <div className="hc-agents-grid">
+      {data.agents.map(a => (
+        <div
+          key={a.id}
+          className={`hc-agent-card ${sel?.id === a.id ? 'selected' : ''}`}
+          onClick={() => setSel(a)}
+          onDoubleClick={() => setSlideout(a)}
+        >
+          <div className="hc-agent-card-header">
+            <div className="hc-agent-avatar lg">{a.avatar}<span className={`dot ${agentStatusTone(a.status)}`} /></div>
+            <Tag tone={agentStatusTone(a.status)}>{a.status}</Tag>
           </div>
-          <dl className="hc-kv">
-            <dt>status</dt><dd><Tag tone={agentStatusTone(sel.status)}>{sel.status}</Tag></dd>
-            <dt>modelo</dt><dd className="hc-mono">{sel.model}</dd>
-            <dt>tipo</dt><dd>{sel.role}</dd>
-            <dt>sessões</dt><dd className="hc-mono">{sel.sessions}</dd>
-            <dt>última vez</dt><dd className="hc-mono">{sel.lastSeen}</dd>
-          </dl>
-          <div className="hc-divider" />
-          <p className="hc-text-sec" style={{ fontSize: 13 }}>{sel.description}</p>
-        </Panel>
-      )}
+          <div className="hc-agent-card-body">
+            <h3>{a.id}</h3>
+            <span className="hc-text-sec">{a.role}</span>
+            <p className="hc-agent-desc">{a.description}</p>
+          </div>
+          <div className="hc-agent-card-footer">
+            <div className="hc-agent-stat">
+              <Icon name="zap" size={12} />
+              <span>{(a.tokens24h/1000).toFixed(1)}k</span>
+            </div>
+            <div className="hc-agent-stat">
+              <Icon name="usage" size={12} />
+              <span>${a.cost24h.toFixed(2)}</span>
+            </div>
+            <button className="hc-btn xs ghost" onClick={(e) => { e.stopPropagation(); setSlideout(a); }}>
+              <Icon name="arrow_up_right" size={12} /> Detalhes
+            </button>
+          </div>
+        </div>
+      ))}
+
+      {slideout && <AgentSlideout agent={slideout} onClose={() => setSlideout(null)} data={data} />}
     </div>
   );
 }
@@ -226,6 +337,77 @@ function ActivityPage({ data }) {
   );
 }
 
+function CostBreakdownChart({ agents, satellites }) {
+  // Combina agents e satellites com custo
+  const items = [
+    ...agents.map(a => ({ id: a.id, label: a.id, cost: a.cost24h || 0, tokens: a.tokens24h || 0, type: 'agent', avatar: a.avatar })),
+    ...satellites.map(s => ({ id: s.id, label: s.name || s.id, cost: 0, tokens: 0, type: 'satellite', avatar: s.id.substring(0, 2).toUpperCase() })),
+  ].filter((item, idx, arr) => arr.findIndex(x => x.id === item.id) === idx); // dedupe
+
+  const totalCost = items.reduce((sum, i) => sum + i.cost, 0) || 1;
+  const maxCost = Math.max(...items.map(i => i.cost), 1);
+
+  // Cores por tipo
+  const colors = ['var(--accent)', 'var(--success)', 'var(--warning)', 'oklch(0.70 0.15 320)', 'oklch(0.70 0.15 50)'];
+
+  return (
+    <div className="hc-cost-breakdown">
+      <div className="hc-cost-donut">
+        <svg viewBox="0 0 100 100">
+          {(() => {
+            let offset = 0;
+            return items.filter(i => i.cost > 0).map((item, idx) => {
+              const pct = (item.cost / totalCost) * 100;
+              const dashArray = `${pct} ${100 - pct}`;
+              const rotation = offset;
+              offset += pct;
+              return (
+                <circle
+                  key={item.id}
+                  cx="50" cy="50" r="40"
+                  fill="none"
+                  stroke={colors[idx % colors.length]}
+                  strokeWidth="12"
+                  strokeDasharray={dashArray}
+                  strokeDashoffset={25 - rotation}
+                  style={{ transition: 'stroke-dasharray 0.5s ease' }}
+                />
+              );
+            });
+          })()}
+          <circle cx="50" cy="50" r="30" fill="var(--bg-panel)" />
+        </svg>
+        <div className="hc-cost-donut-center">
+          <span className="value">${totalCost.toFixed(2)}</span>
+          <span className="label">Total 24h</span>
+        </div>
+      </div>
+
+      <div className="hc-cost-bars">
+        {items.map((item, idx) => (
+          <div key={item.id} className="hc-cost-bar-row">
+            <div className="hc-cost-bar-label">
+              <span className="hc-cost-dot" style={{ background: colors[idx % colors.length] }} />
+              <span className="name">{item.label}</span>
+              <Tag tone={item.type === 'agent' ? 'accent' : 'ok'} style={{ fontSize: 9 }}>{item.type}</Tag>
+            </div>
+            <div className="hc-cost-bar-track">
+              <div
+                className="hc-cost-bar-fill"
+                style={{ width: `${(item.cost / maxCost) * 100}%`, background: colors[idx % colors.length] }}
+              />
+            </div>
+            <div className="hc-cost-bar-value">
+              <span className="cost">${item.cost.toFixed(2)}</span>
+              <span className="tokens">{(item.tokens/1000).toFixed(1)}k</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function UsagePage({ data }) {
   const week = data.usage.week || { cost: 0, daily: [] };
   const daily = week.daily || [];
@@ -246,22 +428,28 @@ function UsagePage({ data }) {
         <Stat label="Sessões hoje" value={data.usage.today.sessions} icon="sessions" />
       </div>
 
-      <Panel title="Custo por dia (últimos 7 dias)" icon="trending" sub={`Total: $${(week.cost || 0).toFixed(2)}`}>
-        <div className="hc-bar-chart">
-          {daily.map((d, i) => (
-            <div key={i} className="hc-bar-col">
-              <div className="hc-bar-value">${d.cost.toFixed(2)}</div>
-              <div className="hc-bar-fill" style={{ height: `${(d.cost / maxCost) * 100}%` }} />
-              <div className="hc-bar-label">{formatDay(d.day)}</div>
-            </div>
-          ))}
-          {daily.length === 0 && (
-            <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-muted)', width: '100%' }}>
-              Sem dados de uso semanal
-            </div>
-          )}
-        </div>
-      </Panel>
+      <div className="hc-grid hc-grid-2">
+        <Panel title="Custo por dia" icon="trending" sub="últimos 7 dias">
+          <div className="hc-bar-chart">
+            {daily.map((d, i) => (
+              <div key={i} className="hc-bar-col">
+                <div className="hc-bar-value">${d.cost.toFixed(2)}</div>
+                <div className="hc-bar-fill" style={{ height: `${(d.cost / maxCost) * 100}%` }} />
+                <div className="hc-bar-label">{formatDay(d.day)}</div>
+              </div>
+            ))}
+            {daily.length === 0 && (
+              <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-muted)', width: '100%' }}>
+                Sem dados de uso semanal
+              </div>
+            )}
+          </div>
+        </Panel>
+
+        <Panel title="Breakdown por Agente" icon="agents" sub="custo 24h">
+          <CostBreakdownChart agents={data.agents} satellites={data.satellites} />
+        </Panel>
+      </div>
 
       <div className="hc-grid hc-grid-2">
         <Panel title="Tokens da sessão" icon="zap">
@@ -274,25 +462,26 @@ function UsagePage({ data }) {
           </dl>
         </Panel>
 
-        <Panel title="Consumo por agente" icon="agents">
-          {data.usage.agents?.length > 0 ? (
-            <table className="hc-tbl">
-              <thead><tr><th>Agente</th><th className="col-r">Tokens</th><th className="col-r">Custo</th></tr></thead>
-              <tbody>
-                {data.usage.agents.map(a => (
+        <Panel title="Consumo detalhado" icon="database">
+          <table className="hc-tbl">
+            <thead><tr><th>Agente</th><th className="col-r">Tokens</th><th className="col-r">Custo</th><th className="col-r">%</th></tr></thead>
+            <tbody>
+              {data.agents.filter(a => a.cost24h > 0 || a.tokens24h > 0).map(a => {
+                const totalCost = data.agents.reduce((sum, ag) => sum + (ag.cost24h || 0), 0) || 1;
+                return (
                   <tr key={a.id}>
                     <td className="hc-text-primary">{a.id}</td>
-                    <td className="mono col-r">{(a.tokens/1000).toFixed(1)}k</td>
-                    <td className="mono col-r">${a.cost.toFixed(2)}</td>
+                    <td className="mono col-r">{(a.tokens24h/1000).toFixed(1)}k</td>
+                    <td className="mono col-r">${a.cost24h.toFixed(2)}</td>
+                    <td className="mono col-r">{((a.cost24h / totalCost) * 100).toFixed(0)}%</td>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          ) : (
-            <div style={{ padding: 16, textAlign: 'center', color: 'var(--text-muted)' }}>
-              Dados por agente não disponíveis
-            </div>
-          )}
+                );
+              })}
+              {data.agents.filter(a => a.cost24h > 0 || a.tokens24h > 0).length === 0 && (
+                <tr><td colSpan="4" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 16 }}>Sem consumo registrado</td></tr>
+              )}
+            </tbody>
+          </table>
         </Panel>
       </div>
     </div>
@@ -687,52 +876,156 @@ function LogsPage({ data }) {
 }
 
 function SessionsPage({ data }) {
-  const [sel, setSel] = usP(data.sessions[0]);
+  const [sessions, setSessions] = usP([]);
+  const [sel, setSel] = usP(null);
+  const [transcript, setTranscript] = usP([]);
+  const [loading, setLoading] = usP(true);
+  const [loadingChat, setLoadingChat] = usP(false);
+  const chatEndRef = urP(null);
+
+  // Carrega sessões da API
+  ueP(() => {
+    setLoading(true);
+    fetch('/api/sessions')
+      .then(r => r.json())
+      .then(data => {
+        setSessions(data);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
+  // Carrega transcript quando seleciona sessão
+  ueP(() => {
+    if (!sel) {
+      setTranscript([]);
+      return;
+    }
+    setLoadingChat(true);
+    fetch(`/api/sessions/${sel.id}/transcript?limit=100`)
+      .then(r => r.json())
+      .then(msgs => {
+        setTranscript(msgs);
+        setLoadingChat(false);
+        // Scroll to bottom
+        setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+      })
+      .catch(() => setLoadingChat(false));
+  }, [sel?.id]);
+
+  const formatTime = (ts) => {
+    if (!ts) return '';
+    try {
+      return new Date(ts).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    } catch { return ''; }
+  };
+
+  const formatDate = (ts) => {
+    if (!ts) return '';
+    try {
+      const d = new Date(ts);
+      const now = new Date();
+      const diff = now.getTime() - d.getTime();
+      if (diff < 60000) return 'agora';
+      if (diff < 3600000) return `${Math.floor(diff / 60000)}min`;
+      if (diff < 86400000) return `${Math.floor(diff / 3600000)}h`;
+      return d.toLocaleDateString('pt-BR');
+    } catch { return ''; }
+  };
+
+  const agentAvatars = { adv: 'AD', araticum: 'AR', designer: 'DS', claudeclaw: 'CC' };
+
   return (
     <div className="hc-split">
-      <Panel title="Sessões" icon="sessions" sub={`${data.sessions.length} total`} className="hc-split-list">
+      <Panel title="Sessões" icon="sessions" sub={`${sessions.length} sessões`} className="hc-split-list"
+        actions={
+          <button className="hc-btn sm ghost" onClick={() => {
+            setLoading(true);
+            fetch('/api/sessions').then(r => r.json()).then(d => { setSessions(d); setLoading(false); });
+          }}>
+            <Icon name="refresh" size={12} />
+          </button>
+        }>
         <div style={{ margin: -14 }}>
-          {data.sessions.map(s => (
-            <div key={s.id} className={`hc-row ${sel?.id === s.id ? 'selected' : ''}`} onClick={() => setSel(s)}>
-              <div className="hc-agent-avatar"><Icon name="sessions" size={13} /><span className={`dot ${s.status === 'active' ? 'ok' : ''}`} /></div>
-              <div className="hc-grow" style={{ minWidth: 0 }}>
-                <div className="hc-text-primary" style={{ fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.title}</div>
-                <div className="hc-meta-line">{s.agent} · {s.platform}</div>
+          {loading ? (
+            <div className="hc-empty"><Icon name="refresh" size={20} style={{ animation: 'spin 1s linear infinite' }} /></div>
+          ) : sessions.length === 0 ? (
+            <div className="hc-empty"><Icon name="sessions" size={24} /><span>Nenhuma sessão</span></div>
+          ) : (
+            sessions.map(s => (
+              <div key={s.id} className={`hc-row ${sel?.id === s.id ? 'selected' : ''}`} onClick={() => setSel(s)}>
+                <div className="hc-agent-avatar">{agentAvatars[s.agent] || s.agent?.substring(0, 2).toUpperCase()}<span className="dot ok" /></div>
+                <div className="hc-grow" style={{ minWidth: 0 }}>
+                  <div className="hc-text-primary" style={{ fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {s.threadId || s.id.substring(0, 8)}
+                  </div>
+                  <div className="hc-meta-line">{s.agent} · {s.turnCount || 0} turnos</div>
+                </div>
+                <div style={{ textAlign: 'right' }}>
+                  <div className="hc-mono hc-muted" style={{ fontSize: 10 }}>{formatDate(s.lastActivity)}</div>
+                </div>
               </div>
-              <div style={{ textAlign: 'right' }}>
-                <div className="hc-mono" style={{ fontSize: 11 }}>{s.msgs} msgs</div>
-                <div className="hc-mono hc-muted" style={{ fontSize: 10 }}>{s.started}</div>
-              </div>
-            </div>
-          ))}
+            ))
+          )}
         </div>
       </Panel>
 
-      {sel && (
-        <Panel title="Conversa" icon="chat" sub={sel.id}
-          actions={<Tag tone={sel.status==='active'?'ok':''}>{sel.status}</Tag>}
-          className="hc-split-detail">
-          <div className="hc-chat">
-            <div className="hc-chat-msgs">
-              {data.transcript.map((m, i) => (
-                <div key={i} className={`hc-msg ${m.role}`}>
-                  <div className="hc-msg-avatar">{m.role === 'user' ? 'DA' : 'CC'}</div>
-                  <div className="hc-msg-body">
-                    <div className="hc-msg-head">
-                      <span className="name">{m.name}</span>
-                      <span className="time">{m.time}</span>
-                    </div>
-                    <div className="hc-msg-content">{m.content}</div>
-                    {m.tool && (
-                      <div className="hc-msg-tool"><span className="tk">{m.tool.name}</span> <span className="hc-muted">·</span> {m.tool.args}</div>
-                    )}
-                  </div>
-                </div>
-              ))}
+      <Panel
+        title={sel ? (sel.threadId || 'Conversa') : 'Conversa'}
+        icon="chat"
+        sub={sel ? `${sel.agent} · ${sel.id.substring(0, 8)}` : 'Selecione uma sessão'}
+        actions={sel && <Tag tone="accent">{sel.agent}</Tag>}
+        className="hc-split-detail"
+      >
+        <div className="hc-chat-view">
+          {!sel ? (
+            <div className="hc-empty">
+              <Icon name="chat" size={32} />
+              <span>Selecione uma sessão para ver o histórico</span>
             </div>
-          </div>
-        </Panel>
-      )}
+          ) : loadingChat ? (
+            <div className="hc-empty"><Icon name="refresh" size={20} style={{ animation: 'spin 1s linear infinite' }} /></div>
+          ) : transcript.length === 0 ? (
+            <div className="hc-empty">
+              <Icon name="chat" size={32} />
+              <span>Sem mensagens nesta sessão</span>
+              <span className="hc-muted" style={{ fontSize: 11 }}>O transcript pode não estar disponível</span>
+            </div>
+          ) : (
+            <div className="hc-chat-scroll">
+              {transcript.map((m, i) => {
+                // Parse content que pode ser JSON array
+                let text = m.content;
+                try {
+                  const parsed = JSON.parse(m.content);
+                  if (Array.isArray(parsed)) {
+                    text = parsed.filter(p => p.type === 'text').map(p => p.text).join('\n');
+                  } else if (parsed.text) {
+                    text = parsed.text;
+                  }
+                } catch {}
+                if (!text || text === '[]') return null;
+
+                return (
+                  <div key={i} className={`hc-chat-bubble ${m.role}`}>
+                    <div className="hc-chat-bubble-avatar">
+                      {m.role === 'user' ? 'DA' : agentAvatars[sel.agent] || 'AI'}
+                    </div>
+                    <div className="hc-chat-bubble-content">
+                      <div className="hc-chat-bubble-header">
+                        <span className="name">{m.role === 'user' ? 'Danilo' : sel.agent}</span>
+                        {m.timestamp && <span className="time">{formatTime(m.timestamp)}</span>}
+                      </div>
+                      <div className="hc-chat-bubble-text">{text}</div>
+                    </div>
+                  </div>
+                );
+              })}
+              <div ref={chatEndRef} />
+            </div>
+          )}
+        </div>
+      </Panel>
     </div>
   );
 }
