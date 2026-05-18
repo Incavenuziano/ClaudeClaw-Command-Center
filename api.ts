@@ -130,47 +130,44 @@ export async function getSatellites(): Promise<SatelliteStatus[]> {
   loadEnv();
 
   const satellites: SatelliteStatus[] = [
-    { id: "adv", name: "ADV Danilo", bot: "@Adv_Danilo_bot", status: "unknown", model: "opus-4.7" },
-    { id: "araticum", name: "Araticum", bot: "@Araticum_bot", status: "unknown", model: "opus-4.7" },
-    { id: "designer", name: "Designer", bot: "@Designer_bot", status: "unknown", model: "opus-4.7" },
-    { id: "claudeclaw", name: "ClaudeClaw", bot: "@ClaudeClaw_Danbot", status: "unknown", model: "opus-4.5" },
+    { id: "adv", name: "ADV Danilo", bot: "@Adv_Danilo_bot", status: "offline", model: "opus-4.7" },
+    { id: "araticum", name: "Araticum", bot: "@Araticum_bot", status: "offline", model: "opus-4.7" },
+    { id: "designer", name: "Designer", bot: "@Designer_bot", status: "offline", model: "opus-4.7" },
+    { id: "claudeclaw", name: "ClaudeClaw", bot: "@ClaudeClaw_Danbot", status: "offline", model: "opus-4.5" },
   ];
 
-  // Mapa de tokens por bot
+  // 1) Detecta processos rodando (verdade absoluta).
+  // Filtra shells bash que apenas contêm a string como argumento de -c.
+  let lines: string[] = [];
+  try {
+    const psOut = execSync("ps -eo pid,comm,args 2>/dev/null", { encoding: "utf-8", timeout: 3000 });
+    lines = psOut.split("\n").filter(l => {
+      // Ignora linhas onde o binário é bash/sh (shells de orquestração)
+      const parts = l.trim().split(/\s+/);
+      const comm = parts[1] || "";
+      return comm !== "bash" && comm !== "sh" && comm !== "zsh";
+    });
+  } catch {}
+
+  for (const sat of satellites) {
+    const matches = (re: RegExp) => lines.some(l => re.test(l));
+    if (sat.id === "claudeclaw") {
+      if (matches(/claudeclaw\/claudeclaw\/[\d.]+\/src\/index\.ts.*start/)) {
+        sat.status = "online";
+      }
+    } else {
+      const re = new RegExp(`src/satellite\\.ts\\s+${sat.id}\\b`);
+      if (matches(re)) sat.status = "online";
+    }
+  }
+
+  // 2) Confirmação adicional: token responde (apenas pra mostrar offline se o bot não existe)
   const tokenMap: Record<string, string | undefined> = {
     adv: process.env.TELEGRAM_BOT_TOKEN_ADV || process.env.TELEGRAM_BOT_TOKEN,
     araticum: process.env.TELEGRAM_BOT_TOKEN_ARATICUM || process.env.TELEGRAM_BOT_TOKEN,
     designer: process.env.TELEGRAM_BOT_TOKEN_DESIGNER || process.env.TELEGRAM_BOT_TOKEN,
     claudeclaw: process.env.TELEGRAM_BOT_TOKEN_CLAUDECLAW || process.env.TELEGRAM_BOT_TOKEN,
   };
-
-  // Testar conectividade de cada bot via Telegram API
-  for (const sat of satellites) {
-    const token = tokenMap[sat.id];
-    if (token) {
-      try {
-        const res = await fetch(`https://api.telegram.org/bot${token}/getMe`, { signal: AbortSignal.timeout(5000) });
-        if (res.ok) {
-          const data = await res.json() as { ok: boolean; result?: { username: string } };
-          if (data.ok && data.result) {
-            // Verifica se é o bot certo pelo username
-            const expectedUsername = sat.bot.replace("@", "").toLowerCase();
-            const actualUsername = data.result.username.toLowerCase();
-            if (actualUsername === expectedUsername) {
-              sat.status = "online";
-            } else {
-              // Token genérico, bot funciona mas não é específico
-              sat.status = "online";
-            }
-          }
-        } else {
-          sat.status = "offline";
-        }
-      } catch {
-        sat.status = "offline";
-      }
-    }
-  }
 
   return satellites;
 }
