@@ -135,6 +135,11 @@ const server = Bun.serve({
       return Response.json(data);
     }
 
+    if (pathname === "/api/satellites/sessions") {
+      const data = await api.getSatellitesSessions();
+      return Response.json(data);
+    }
+
     if (pathname === "/api/crons") {
       const data = await api.getCrons();
       return Response.json(data);

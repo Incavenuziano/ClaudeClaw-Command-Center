@@ -595,18 +595,39 @@ function SatellitesPage({ data }) {
 
   return (
     <div className="hc-split">
-      <Panel title="Satellites" icon="channels" sub="Bots Telegram" className="hc-split-list">
+      <Panel title="Satellites" icon="channels" sub="Bots Telegram · sessões persistentes" className="hc-split-list">
         <div style={{ margin: -14 }}>
-          {data.satellites.map(s => (
-            <div key={s.id} className={`hc-row ${selected?.id === s.id ? 'selected' : ''}`} onClick={() => { setSelected(s); setChatHistory([]); }} style={{ cursor: 'pointer' }}>
-              <Icon name="channels" size={16} stroke={1.75} style={{ color: s.status === 'online' ? 'var(--success)' : 'var(--danger)' }} />
-              <div className="hc-grow">
-                <div className="hc-text-primary" style={{ fontSize: 14, fontWeight: 500 }}>{s.name}</div>
-                <div className="hc-meta-line">{s.bot} · {s.model}</div>
+          {data.satellites.map(s => {
+            const sess = (data.satellitesSessions || []).find(x => x.agent === s.id);
+            const sessTone = !sess ? null
+              : sess.status === 'ok' ? 'ok'
+              : sess.status === 'warning' ? 'warn'
+              : sess.status === 'expired' ? 'err'
+              : null;
+            const sessLabel = !sess ? null
+              : sess.status === 'no_session' ? 'sem sessão'
+              : sess.status === 'expired' ? `expirada (${Math.abs(sess.ttlRemainingDays)}d)`
+              : sess.status === 'warning' ? `reset em ${sess.ttlRemainingDays}d`
+              : `${sess.ageHours}h`;
+            return (
+              <div key={s.id} className={`hc-row ${selected?.id === s.id ? 'selected' : ''}`} onClick={() => { setSelected(s); setChatHistory([]); }} style={{ cursor: 'pointer' }}>
+                <Icon name="channels" size={16} stroke={1.75} style={{ color: s.status === 'online' ? 'var(--success)' : 'var(--danger)' }} />
+                <div className="hc-grow">
+                  <div className="hc-text-primary" style={{ fontSize: 14, fontWeight: 500 }}>{s.name}</div>
+                  <div className="hc-meta-line">{s.bot} · {s.model}</div>
+                  {sess && sess.sessionIdShort && (
+                    <div className="hc-meta-line" style={{ fontFamily: 'monospace', fontSize: 11, opacity: 0.7 }}>
+                      ses {sess.sessionIdShort}… · {sess.turns24h}t 24h{sess.recovered24h > 0 ? ` · ${sess.recovered24h} recovered` : ''}
+                    </div>
+                  )}
+                </div>
+                <div className="hc-flex-col" style={{ gap: 4, alignItems: 'flex-end' }}>
+                  <Tag tone={s.status === 'online' ? 'ok' : 'err'}>{s.status}</Tag>
+                  {sessTone && sessLabel && <Tag tone={sessTone}>{sessLabel}</Tag>}
+                </div>
               </div>
-              <Tag tone={s.status === 'online' ? 'ok' : 'err'}>{s.status}</Tag>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </Panel>
 

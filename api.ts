@@ -156,7 +156,8 @@ export async function getSatellites(): Promise<SatelliteStatus[]> {
         sat.status = "online";
       }
     } else {
-      const re = new RegExp(`src/satellite\\.ts\\s+${sat.id}\\b`);
+      // Aceita ambas as versões: satellite-session.ts (atual) e satellite.ts (legado)
+      const re = new RegExp(`src/satellite(-session)?\\.ts\\s+${sat.id}\\b`);
       if (matches(re)) sat.status = "online";
     }
   }
@@ -1103,6 +1104,93 @@ async function getTelegramTranscript(limit = 50): Promise<TranscriptMessage[]> {
   return messages;
 }
 
+interface SatelliteSessionHealth {
+  agent: string;
+  sessionId: string | null;
+  sessionIdShort: string | null;
+  ageHours: number | null;
+  ttlRemainingDays: number | null;
+  turns24h: number;
+  recovered24h: number;
+  status: "ok" | "warning" | "expired" | "no_session";
+  lastActivity: number | null;
+}
+
+const SESSION_TTL_DAYS = 7;
+const SESSION_WARNING_DAYS = 5;
+
+export async function getSatellitesSessions(): Promise<SatelliteSessionHealth[]> {
+  const agents = ["adv", "araticum", "designer"];
+  const danilo = 416112154;
+  const out: SatelliteSessionHealth[] = [];
+
+  for (const agent of agents) {
+    const agentDir = `/home/danilo/claudeclaw/agents/${agent}`;
+    const sessionFile = `${agentDir}/sessions/${danilo}.json`;
+    const logFile = `${agentDir}/logs/sessions.jsonl`;
+
+    const entry: SatelliteSessionHealth = {
+      agent,
+      sessionId: null,
+      sessionIdShort: null,
+      ageHours: null,
+      ttlRemainingDays: null,
+      turns24h: 0,
+      recovered24h: 0,
+      status: "no_session",
+      lastActivity: null,
+    };
+
+    try {
+      const raw = await readFile(sessionFile, "utf-8");
+      const state = JSON.parse(raw) as { sessionId?: string; lastActivity?: number };
+      if (state.sessionId) {
+        entry.sessionId = state.sessionId;
+        entry.sessionIdShort = state.sessionId.slice(0, 8);
+        if (state.lastActivity) {
+          entry.lastActivity = state.lastActivity;
+          const ageMs = Date.now() - state.lastActivity;
+          entry.ageHours = Math.round((ageMs / 3600000) * 10) / 10;
+          const ageDays = ageMs / 86400000;
+          entry.ttlRemainingDays = Math.round((SESSION_TTL_DAYS - ageDays) * 10) / 10;
+          if (ageDays >= SESSION_TTL_DAYS) {
+            entry.status = "expired";
+          } else if (ageDays >= SESSION_WARNING_DAYS) {
+            entry.status = "warning";
+          } else {
+            entry.status = "ok";
+          }
+        }
+      }
+    } catch {
+      // sem session file → status: no_session
+    }
+
+    // Conta turnos das últimas 24h via JSONL
+    try {
+      const log = await readFile(logFile, "utf-8");
+      const cutoff = Date.now() - 24 * 3600000;
+      const lines = log.trim().split("\n").slice(-500);
+      for (const line of lines) {
+        try {
+          const ev = JSON.parse(line);
+          if (ev.event !== "turn") continue;
+          const ts = new Date(ev.timestamp).getTime();
+          if (ts < cutoff) continue;
+          entry.turns24h++;
+          if (ev.recovered) entry.recovered24h++;
+        } catch {}
+      }
+    } catch {
+      // sem log
+    }
+
+    out.push(entry);
+  }
+
+  return out;
+}
+
 interface RateLimitWindow {
   tokens: number;
   limit: number;
@@ -1272,6 +1360,7 @@ export const api = {
   getUsage,
   getRateLimit,
   getUsageByProject,
+  getSatellitesSessions,
   execCommand,
   getPncp,
   sendToSatellite,
