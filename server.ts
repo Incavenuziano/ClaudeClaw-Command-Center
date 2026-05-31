@@ -170,6 +170,22 @@ const server = Bun.serve({
       return Response.json(data);
     }
 
+    // Calibração supervisionada do rate limit (ADR-006)
+    if (pathname === "/api/calibrate" && req.method === "POST") {
+      try {
+        const body = await req.json() as { window?: string; pct?: number };
+        const win = body.window === "week" ? "week" : "5h";
+        const pct = Number(body.pct);
+        if (!pct || pct <= 0 || pct > 100) {
+          return Response.json({ error: "pct deve ser 1-100" }, { status: 400 });
+        }
+        const result = await api.calibrateRateLimit(win, pct);
+        return Response.json(result);
+      } catch {
+        return Response.json({ error: "body inválido" }, { status: 400 });
+      }
+    }
+
     if (pathname === "/api/usage-by-project") {
       const data = await api.getUsageByProject();
       return Response.json(data);
