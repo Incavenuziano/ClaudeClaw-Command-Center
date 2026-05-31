@@ -603,9 +603,9 @@ interface UsageData {
 let lastUsageScan = 0;
 const USAGE_SCAN_INTERVAL_MS = 60 * 60 * 1000; // 60 minutos
 
-async function runUsageScanIfNeeded(): Promise<void> {
+async function runUsageScanIfNeeded(force = false): Promise<void> {
   const now = Date.now();
-  if (now - lastUsageScan < USAGE_SCAN_INTERVAL_MS) {
+  if (!force && now - lastUsageScan < USAGE_SCAN_INTERVAL_MS) {
     return; // Cache ainda válido
   }
 
@@ -1282,6 +1282,11 @@ interface RateLimitWindow {
   etaMinutes: number | null; // min até bater o limite no ritmo atual
   limitSource: "calibrated" | "p90" | "tier";  // origem do denominador
   calibratedAgeHours: number | null;           // idade da última calibração
+  // ── frescor dos dados (correção 100% fantasma) ──
+  dataAgeMinutes: number;    // há quanto tempo foi o último turn registrado
+  freshness: "fresh" | "stale" | "limit_reached";
+  // fresh = dados recentes; stale = scan parado (não confie);
+  // limit_reached = dados velhos + pressão alta → provável bloqueio real
 }
 
 interface RateLimitInfo {
@@ -1404,6 +1409,21 @@ export function recordCalibration(window: "5h" | "week", pctReal: number, tokens
   );
 }
 
+// Idade (min) do último turn no DB — detecta scan parado / bloqueio no limite
+function dataAgeMinutes(): number {
+  const last = sqliteRL(`SELECT MAX(timestamp) FROM turns`);
+  if (!last) return 99999;
+  const ms = Date.now() - new Date(last).getTime();
+  return Math.max(0, Math.round(ms / 60000));
+}
+
+// Classifica o frescor dos dados de uma janela (correção do "100% fantasma")
+function classifyFreshness(ageMin: number, pressure: number): "fresh" | "stale" | "limit_reached" {
+  if (ageMin <= 15) return "fresh";
+  // Dados velhos: se pressão alta, provável bloqueio real; senão, scan parado
+  return pressure >= 0.9 ? "limit_reached" : "stale";
+}
+
 function nextWedAt7h(): Date {
   const now = new Date();
   // weekday: 0=Sun ... 3=Wed
@@ -1491,6 +1511,11 @@ export async function getRateLimit(): Promise<RateLimitInfo> {
   const best = rank[lim5h.source] >= rank[limWeek.source] ? lim5h.source : limWeek.source;
   const overallSource = best === "tier" ? "estimate" : best;
 
+  // Frescor dos dados — distingue "limite atingido" de "scan parado"
+  const ageMin = dataAgeMinutes();
+  const fresh5h = classifyFreshness(ageMin, p5h);
+  const freshWeek = classifyFreshness(ageMin, pWeek);
+
   return {
     tier,
     five_hour: {
@@ -1505,6 +1530,8 @@ export async function getRateLimit(): Promise<RateLimitInfo> {
       etaMinutes: burn5h.eta,
       limitSource: lim5h.source,
       calibratedAgeHours: lim5h.ageHours === null ? null : Math.round(lim5h.ageHours * 10) / 10,
+      dataAgeMinutes: ageMin,
+      freshness: fresh5h,
     },
     weekly: {
       tokens: tokensWeek,
@@ -1518,6 +1545,8 @@ export async function getRateLimit(): Promise<RateLimitInfo> {
       etaMinutes: burnWeek.eta,
       limitSource: limWeek.source,
       calibratedAgeHours: limWeek.ageHours === null ? null : Math.round(limWeek.ageHours * 10) / 10,
+      dataAgeMinutes: ageMin,
+      freshness: freshWeek,
     },
     source: overallSource,
   };
@@ -1575,6 +1604,8 @@ export async function calibrateRateLimit(
   window: "5h" | "week",
   pctReal: number
 ): Promise<{ ok: true; window: string; pct: number; tokens: number; derivedLimit: number }> {
+  // Força scan antes de calibrar — garante tokens frescos no instante (correção da defasagem)
+  await runUsageScanIfNeeded(true);
   function count(since: string): number {
     const out = sqliteRL(
       `SELECT COALESCE(ROUND(SUM(input_tokens)+SUM(output_tokens)+SUM(cache_creation_tokens)*0.8),0) ` +
