@@ -1473,7 +1473,18 @@ export async function getRateLimit(): Promise<RateLimitInfo> {
   const burn5h = burnAndEta(30, tokens5h, lim5h.limit);
   const burnWeek = burnAndEta(360, tokensWeek, limWeek.limit);
 
-  const fiveHourReset = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
+  // Reset 5h é janela ROLLING: reseta quando o turn mais antigo dentro das
+  // últimas 5h "sai" da janela → reset = (turn mais antigo nas últimas 5h) + 5h.
+  // Se não há turn na janela, já está zerada → reset = agora.
+  let fiveHourReset: string;
+  const oldestIn5h = sqliteRL(
+    `SELECT MIN(timestamp) FROM turns WHERE datetime(timestamp) > datetime('now','-5 hours')`
+  );
+  if (oldestIn5h) {
+    fiveHourReset = new Date(new Date(oldestIn5h).getTime() + 5 * 3600000).toISOString();
+  } else {
+    fiveHourReset = new Date().toISOString();
+  }
   const weeklyReset = nextWedAt7h().toISOString();
 
   const rank = { calibrated: 3, p90: 2, tier: 1 } as const;
