@@ -126,14 +126,45 @@ function loadEnv() {
   } catch {}
 }
 
+// Normaliza model ID completo → label curto pra UI (claude-opus-4-8 → opus-4.8)
+function shortModelLabel(model: string | undefined): string {
+  if (!model) return "—";
+  const m = model.toLowerCase();
+  const match = m.match(/(opus|sonnet|haiku)[-]?(\d+)[-.](\d+)/);
+  if (match) return `${match[1]}-${match[2]}.${match[3]}`;
+  // Aliases simples ("opus", "sonnet")
+  if (m === "opus") return "opus";
+  if (m === "sonnet") return "sonnet";
+  if (m === "haiku") return "haiku";
+  return model;
+}
+
+// Lê o modelo configurado de cada agente/daemon a partir do config.json/settings.json
+function readSatelliteModel(id: string): string {
+  try {
+    if (id === "claudeclaw") {
+      const settings = JSON.parse(
+        require("fs").readFileSync("/home/danilo/claudeclaw/.claude/claudeclaw/settings.json", "utf-8")
+      );
+      return shortModelLabel(settings.model);
+    }
+    const cfg = JSON.parse(
+      require("fs").readFileSync(`/home/danilo/claudeclaw/agents/${id}/config.json`, "utf-8")
+    );
+    return shortModelLabel(cfg.model);
+  } catch {
+    return "—";
+  }
+}
+
 export async function getSatellites(): Promise<SatelliteStatus[]> {
   loadEnv();
 
   const satellites: SatelliteStatus[] = [
-    { id: "adv", name: "ADV Danilo", bot: "@Adv_Danilo_bot", status: "offline", model: "opus-4.7" },
-    { id: "araticum", name: "Araticum", bot: "@Araticum_bot", status: "offline", model: "opus-4.7" },
-    { id: "designer", name: "Designer", bot: "@Designer_bot", status: "offline", model: "opus-4.7" },
-    { id: "claudeclaw", name: "ClaudeClaw", bot: "@ClaudeClaw_Danbot", status: "offline", model: "opus-4.5" },
+    { id: "adv", name: "ADV Danilo", bot: "@Adv_Danilo_bot", status: "offline", model: readSatelliteModel("adv") },
+    { id: "araticum", name: "Araticum", bot: "@Araticum_bot", status: "offline", model: readSatelliteModel("araticum") },
+    { id: "designer", name: "Designer", bot: "@Designer_bot", status: "offline", model: readSatelliteModel("designer") },
+    { id: "claudeclaw", name: "ClaudeClaw", bot: "@ClaudeClaw_Danbot", status: "offline", model: readSatelliteModel("claudeclaw") },
   ];
 
   // 1) Detecta processos rodando (verdade absoluta).
@@ -162,14 +193,6 @@ export async function getSatellites(): Promise<SatelliteStatus[]> {
     }
   }
 
-  // 2) Confirmação adicional: token responde (apenas pra mostrar offline se o bot não existe)
-  const tokenMap: Record<string, string | undefined> = {
-    adv: process.env.TELEGRAM_BOT_TOKEN_ADV || process.env.TELEGRAM_BOT_TOKEN,
-    araticum: process.env.TELEGRAM_BOT_TOKEN_ARATICUM || process.env.TELEGRAM_BOT_TOKEN,
-    designer: process.env.TELEGRAM_BOT_TOKEN_DESIGNER || process.env.TELEGRAM_BOT_TOKEN,
-    claudeclaw: process.env.TELEGRAM_BOT_TOKEN_CLAUDECLAW || process.env.TELEGRAM_BOT_TOKEN,
-  };
-
   return satellites;
 }
 
@@ -181,6 +204,76 @@ interface CronJob {
   enabled: boolean;
   lastRun?: string;
   lastStatus?: "ok" | "err" | "warn";
+}
+
+// Mapeia trechos do comando → nome amigável + id estável
+function inferCronMeta(command: string): { name: string; id: string } {
+  const map: Array<[RegExp, string, string]> = [
+    [/monitor-processos/, "Monitor Processos", "cr_monitor"],
+    [/pncp-scan|pncp\.ts|varredura.*pncp/i, "Varredura PNCP", "cr_pncp"],
+    [/inteligencia_competitiva/, "Inteligência Competitiva", "cr_ic"],
+    [/siged/i, "SIGED (SEFAZ-AM)", "cr_siged"],
+    [/prazos/i, "Prazos Jurídicos", "cr_prazos"],
+    [/satellites_ensure/, "Watchdog Satellites", "cr_watchdog"],
+    [/satellites_session_health/, "Health Sessions", "cr_health"],
+    [/memory-optimizer/, "Otimizador de Memória", "cr_memopt"],
+    [/memory_ttl/, "Memory TTL", "cr_memttl"],
+    [/quality_eval/, "Avaliação de Qualidade", "cr_quality"],
+    [/vault_reindex/, "Reindex Vault", "cr_vault"],
+    [/backup/i, "Backup", "cr_backup"],
+  ];
+  for (const [re, name, id] of map) {
+    if (re.test(command)) return { name, id };
+  }
+  return { name: "Job desconhecido", id: "" };
+}
+
+// Extrai o caminho do arquivo de log do redirecionamento (>> path 2>&1)
+// Aceita .log, .txt, .jsonl — qualquer destino de redirect
+function extractLogPath(command: string): string | null {
+  const m = command.match(/>>?\s*(\S+\.(?:log|txt|jsonl|out))\b/);
+  return m ? m[1] : null;
+}
+
+// Lê mtime + escaneia tail do log pra derivar lastRun e lastStatus reais
+function readCronRunState(logPath: string | null): { lastRun?: string; lastStatus: "ok" | "err" | "warn" } {
+  if (!logPath) return { lastStatus: "warn" };
+  try {
+    const fs = require("fs");
+    const st = fs.statSync(logPath);
+    const lastRun = new Date(st.mtimeMs).toISOString();
+
+    // Log vazio = nunca produziu saída útil
+    if (st.size === 0) return { lastRun, lastStatus: "warn" };
+
+    // Escaneia as últimas linhas. Prioriza marcadores explícitos de veredito
+    // (job-runner emite "✅ sucesso" / "🔴 Job falhou") sobre heurística de palavras.
+    const rawTail = execSync(`tail -30 "${logPath}" 2>/dev/null`, { encoding: "utf-8" });
+    const tail = rawTail.toLowerCase();
+
+    // 1) Veredito explícito do job-runner ou do próprio job (última ocorrência vence)
+    const lastSuccess = Math.max(
+      tail.lastIndexOf("✅ sucesso"),
+      tail.lastIndexOf("🏁 monitoramento concluído"),
+      tail.lastIndexOf("monitoramento concluído"),
+    );
+    const lastFailure = Math.max(
+      tail.lastIndexOf("🔴 job falhou"),
+      tail.lastIndexOf("job falhou"),
+    );
+    if (lastSuccess >= 0 || lastFailure >= 0) {
+      return { lastRun, lastStatus: lastFailure > lastSuccess ? "err" : "ok" };
+    }
+
+    // 2) Sem veredito explícito → heurística de palavras
+    const errSignals = /(error|erro|traceback|exception|failed|falhou|exit code [1-9]|❌|🔴|no such file|modulenotfound|timeout)/;
+    const warnSignals = /(warn|aviso|retry|tentativa|skip|⚠)/;
+    if (errSignals.test(tail)) return { lastRun, lastStatus: "err" };
+    if (warnSignals.test(tail)) return { lastRun, lastStatus: "warn" };
+    return { lastRun, lastStatus: "ok" };
+  } catch {
+    return { lastStatus: "warn" }; // log não existe → nunca rodou
+  }
 }
 
 export async function getCrons(): Promise<CronJob[]> {
@@ -196,43 +289,23 @@ export async function getCrons(): Promise<CronJob[]> {
         const schedule = match[1];
         const command = match[2];
 
-        let name = "Unknown job";
-        let id = `cron_${crons.length}`;
-
-        if (command.includes("monitor-processos")) {
-          name = "Monitor Processos";
-          id = "cr_monitor";
-        } else if (command.includes("pncp")) {
-          name = "Varredura PNCP";
-          id = "cr_pncp";
-        } else if (command.includes("backup")) {
-          name = "Backup";
-          id = "cr_backup";
-        }
+        const meta = inferCronMeta(command);
+        const id = meta.id || `cron_${crons.length}`;
+        const logPath = extractLogPath(command);
+        const runState = readCronRunState(logPath);
 
         crons.push({
           id,
-          name,
+          name: meta.name,
           schedule,
           command,
-          enabled: true,
-          lastStatus: "ok",
+          enabled: true, // está no crontab ativo
+          lastRun: runState.lastRun,
+          lastStatus: runState.lastStatus,
         });
       }
     }
   } catch {}
-
-  // Adicionar jobs conhecidos mesmo se não estiverem no crontab
-  if (!crons.find(c => c.id === "cr_monitor")) {
-    crons.push({
-      id: "cr_monitor",
-      name: "Monitor Processos",
-      schedule: "0 8 * * 1-5",
-      command: "bun run src/jobs/monitor-processos.ts",
-      enabled: false,
-      lastStatus: "ok",
-    });
-  }
 
   return crons;
 }
@@ -571,8 +644,13 @@ if not DB_PATH.exists():
 
 conn = sqlite3.connect(DB_PATH)
 conn.row_factory = sqlite3.Row
-today = date.today().isoformat()
-week_start = (date.today() - timedelta(days=6)).isoformat()
+# Timestamps no DB são UTC. Danilo está em Brasília (UTC-3): calcula "hoje" em BSB
+# e converte timestamp UTC→BSB no SQL antes de extrair a data.
+from datetime import datetime, timezone
+BSB = timezone(timedelta(hours=-3))
+now_bsb = datetime.now(BSB)
+today = now_bsb.date().isoformat()
+week_start = (now_bsb.date() - timedelta(days=6)).isoformat()
 
 # Pricing (per 1M tokens) - preços atuais da API Anthropic
 PRICING = {
@@ -596,18 +674,18 @@ def calc_cost(model, inp, out, cr, cc):
 today_rows = conn.execute("""
     SELECT model, SUM(input_tokens) as inp, SUM(output_tokens) as out,
            SUM(cache_read_tokens) as cr, SUM(cache_creation_tokens) as cc, COUNT(*) as turns
-    FROM turns WHERE substr(timestamp, 1, 10) = ? GROUP BY model
+    FROM turns WHERE substr(datetime(timestamp, '-3 hours'), 1, 10) = ? GROUP BY model
 """, (today,)).fetchall()
 
 today_sessions = conn.execute("""
-    SELECT COUNT(DISTINCT session_id) FROM turns WHERE substr(timestamp, 1, 10) = ?
+    SELECT COUNT(DISTINCT session_id) FROM turns WHERE substr(datetime(timestamp, '-3 hours'), 1, 10) = ?
 """, (today,)).fetchone()[0]
 
 # Week stats by day and model (para cálculo correto de custo)
 week_by_day_model = conn.execute("""
-    SELECT substr(timestamp, 1, 10) as day, model, SUM(input_tokens) as inp, SUM(output_tokens) as out,
+    SELECT substr(datetime(timestamp, '-3 hours'), 1, 10) as day, model, SUM(input_tokens) as inp, SUM(output_tokens) as out,
            SUM(cache_read_tokens) as cr, SUM(cache_creation_tokens) as cc
-    FROM turns WHERE substr(timestamp, 1, 10) BETWEEN ? AND ?
+    FROM turns WHERE substr(datetime(timestamp, '-3 hours'), 1, 10) BETWEEN ? AND ?
     GROUP BY day, model ORDER BY day
 """, (week_start, today)).fetchall()
 
