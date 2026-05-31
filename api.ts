@@ -1276,13 +1276,19 @@ interface RateLimitWindow {
   pressurePct: number;  // 0-100
   status: "ok" | "warning" | "critical";
   resetAt: string;      // ISO timestamp da próxima reset
+  // ── extras (ADR-006) ──
+  opusTokens: number;        // quanto do consumo é Opus
+  burnRatePerMin: number;    // tokens/min recentes
+  etaMinutes: number | null; // min até bater o limite no ritmo atual
+  limitSource: "calibrated" | "p90" | "tier";  // origem do denominador
+  calibratedAgeHours: number | null;           // idade da última calibração
 }
 
 interface RateLimitInfo {
   tier: string;
   five_hour: RateLimitWindow;
   weekly: RateLimitWindow;
-  source: "estimate";  // calibrado com dados da Anthropic em 2026-05-17
+  source: "calibrated" | "p90" | "estimate";
 }
 
 // Calibrado em 2026-05-17 com Danilo: 1.26M = 24% (5h), 15.1M = 11% (semana)
@@ -1294,6 +1300,108 @@ const TIER_LIMITS: Record<string, { fiveHour: number; weekly: number }> = {
 
 function statusFromPressure(p: number): "ok" | "warning" | "critical" {
   return p < 0.5 ? "ok" : p < 0.8 ? "warning" : "critical";
+}
+
+const USAGE_DB = "/home/danilo/.claude/usage.db";
+
+function sqliteRL(query: string): string {
+  try {
+    return execSync(`sqlite3 ${USAGE_DB} ${JSON.stringify(query)}`, {
+      encoding: "utf-8",
+      timeout: 5000,
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function ensureCalibrationTable(): void {
+  sqliteRL(
+    "CREATE TABLE IF NOT EXISTS rate_limit_calibration (" +
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, window TEXT NOT NULL, " +
+    "pct_real REAL NOT NULL, tokens_calc INTEGER NOT NULL, created_at TEXT NOT NULL)"
+  );
+}
+
+// Calibração mais recente de uma janela → limite derivado + idade (horas)
+function readCalibration(window: "5h" | "week"): { limit: number; ageHours: number } | null {
+  const row = sqliteRL(
+    `SELECT pct_real, tokens_calc, created_at FROM rate_limit_calibration ` +
+    `WHERE window='${window}' ORDER BY created_at DESC LIMIT 1`
+  );
+  if (!row) return null;
+  const [pctStr, tokStr, createdAt] = row.split("|");
+  const pct = parseFloat(pctStr);
+  const tok = parseInt(tokStr, 10);
+  if (!pct || pct <= 0 || !tok) return null;
+  return {
+    limit: Math.round(tok / (pct / 100)),
+    ageHours: (Date.now() - new Date(createdAt).getTime()) / 3600000,
+  };
+}
+
+// P90 do histórico de 8 dias (denominador aprendido)
+function p90Limit(window: "5h" | "week"): number | null {
+  const bucket =
+    window === "5h"
+      ? "CAST(strftime('%s', timestamp) / 18000 AS INT)"
+      : "strftime('%Y-%W', timestamp)";
+  const out = sqliteRL(
+    `SELECT ROUND(SUM(input_tokens)+SUM(output_tokens)+SUM(cache_creation_tokens)*0.8) AS t ` +
+    `FROM turns WHERE datetime(timestamp) > datetime('now','-8 days') GROUP BY ${bucket} ORDER BY t`
+  );
+  if (!out) return null;
+  const vals = out.split("\n").map((v) => parseFloat(v)).filter((v) => v > 0);
+  if (vals.length < 3) return null;
+  return Math.round(vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.9))]);
+}
+
+// Escolhe o melhor denominador: calibração fresca > P90 > tier fixo
+function resolveLimit(
+  window: "5h" | "week",
+  tierLimit: number
+): { limit: number; source: "calibrated" | "p90" | "tier"; ageHours: number | null } {
+  const maxAge = window === "5h" ? 48 : 24 * 7; // calibração decai
+  const cal = readCalibration(window);
+  if (cal && cal.ageHours <= maxAge) {
+    return { limit: cal.limit, source: "calibrated", ageHours: cal.ageHours };
+  }
+  const p90 = p90Limit(window);
+  if (p90 && p90 > 0) return { limit: p90, source: "p90", ageHours: null };
+  return { limit: tierLimit, source: "tier", ageHours: null };
+}
+
+// Burn-rate (tokens/min) numa janela curta + ETA até o limite
+function burnAndEta(windowMinutes: number, tokensNow: number, limit: number): { burn: number; eta: number | null } {
+  const out = sqliteRL(
+    `SELECT COALESCE(ROUND(SUM(input_tokens)+SUM(output_tokens)+SUM(cache_creation_tokens)*0.8),0) ` +
+    `FROM turns WHERE datetime(timestamp) > datetime('now','-${windowMinutes} minutes')`
+  );
+  const recent = parseFloat(out) || 0;
+  const burn = recent / windowMinutes;
+  if (burn <= 0) return { burn: 0, eta: null };
+  const remaining = limit - tokensNow;
+  if (remaining <= 0) return { burn: Math.round(burn), eta: 0 };
+  return { burn: Math.round(burn), eta: Math.round(remaining / burn) };
+}
+
+// Conta tokens só de Opus numa janela
+function opusTokensIn(sinceClause: string): number {
+  const out = sqliteRL(
+    `SELECT COALESCE(ROUND(SUM(input_tokens)+SUM(output_tokens)+SUM(cache_creation_tokens)*0.8),0) ` +
+    `FROM turns WHERE datetime(timestamp) > ${sinceClause} AND lower(model) LIKE '%opus%'`
+  );
+  return Math.round(parseFloat(out)) || 0;
+}
+
+// Grava um ponto de calibração (ADR-006)
+export function recordCalibration(window: "5h" | "week", pctReal: number, tokensCalc: number): void {
+  ensureCalibrationTable();
+  const now = new Date().toISOString();
+  sqliteRL(
+    `INSERT INTO rate_limit_calibration (window, pct_real, tokens_calc, created_at) ` +
+    `VALUES ('${window}', ${pctReal}, ${tokensCalc}, '${now}')`
+  );
 }
 
 function nextWedAt7h(): Date {
@@ -1345,37 +1453,62 @@ export async function getRateLimit(): Promise<RateLimitInfo> {
     }
   }
 
-  const tokens5h = countTokens(`datetime('now', '-5 hours')`);
+  ensureCalibrationTable();
+
+  const fiveHourSince = `datetime('now', '-5 hours')`;
+  const tokens5h = countTokens(fiveHourSince);
   const lastWed = lastWedAt7h();
   const weekStart = lastWed.toISOString().replace("T", " ").substring(0, 19);
-  const tokensWeek = countTokens(`datetime('${weekStart}')`);
+  const weekSince = `datetime('${weekStart}')`;
+  const tokensWeek = countTokens(weekSince);
 
-  const p5h = Math.min(1, tokens5h / limits.fiveHour);
-  const pWeek = Math.min(1, tokensWeek / limits.weekly);
+  // Denominador: calibração fresca > P90 > tier (ADR-006)
+  const lim5h = resolveLimit("5h", limits.fiveHour);
+  const limWeek = resolveLimit("week", limits.weekly);
 
-  // Próxima reset 5h: agora + 5h (rolling window — heurística)
+  const p5h = Math.min(1, tokens5h / lim5h.limit);
+  const pWeek = Math.min(1, tokensWeek / limWeek.limit);
+
+  // Burn-rate: 30min pro 5h, 6h pro semanal
+  const burn5h = burnAndEta(30, tokens5h, lim5h.limit);
+  const burnWeek = burnAndEta(360, tokensWeek, limWeek.limit);
+
   const fiveHourReset = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
   const weeklyReset = nextWedAt7h().toISOString();
+
+  const rank = { calibrated: 3, p90: 2, tier: 1 } as const;
+  const best = rank[lim5h.source] >= rank[limWeek.source] ? lim5h.source : limWeek.source;
+  const overallSource = best === "tier" ? "estimate" : best;
 
   return {
     tier,
     five_hour: {
       tokens: tokens5h,
-      limit: limits.fiveHour,
+      limit: lim5h.limit,
       pressure: p5h,
       pressurePct: Math.round(p5h * 100),
       status: statusFromPressure(p5h),
       resetAt: fiveHourReset,
+      opusTokens: opusTokensIn(fiveHourSince),
+      burnRatePerMin: burn5h.burn,
+      etaMinutes: burn5h.eta,
+      limitSource: lim5h.source,
+      calibratedAgeHours: lim5h.ageHours === null ? null : Math.round(lim5h.ageHours * 10) / 10,
     },
     weekly: {
       tokens: tokensWeek,
-      limit: limits.weekly,
+      limit: limWeek.limit,
       pressure: pWeek,
       pressurePct: Math.round(pWeek * 100),
       status: statusFromPressure(pWeek),
       resetAt: weeklyReset,
+      opusTokens: opusTokensIn(weekSince),
+      burnRatePerMin: burnWeek.burn,
+      etaMinutes: burnWeek.eta,
+      limitSource: limWeek.source,
+      calibratedAgeHours: limWeek.ageHours === null ? null : Math.round(limWeek.ageHours * 10) / 10,
     },
-    source: "estimate",
+    source: overallSource,
   };
 }
 
@@ -1426,6 +1559,35 @@ function friendlyProjectName(cwd: string): string {
   return norm;
 }
 
+// Calibra uma janela: calcula tokens atuais e grava o ponto (ADR-006)
+export async function calibrateRateLimit(
+  window: "5h" | "week",
+  pctReal: number
+): Promise<{ ok: true; window: string; pct: number; tokens: number; derivedLimit: number }> {
+  function count(since: string): number {
+    const out = sqliteRL(
+      `SELECT COALESCE(ROUND(SUM(input_tokens)+SUM(output_tokens)+SUM(cache_creation_tokens)*0.8),0) ` +
+      `FROM turns WHERE datetime(timestamp) > ${since}`
+    );
+    return Math.round(parseFloat(out)) || 0;
+  }
+  let tokens: number;
+  if (window === "5h") {
+    tokens = count(`datetime('now', '-5 hours')`);
+  } else {
+    const ws = lastWedAt7h().toISOString().replace("T", " ").substring(0, 19);
+    tokens = count(`datetime('${ws}')`);
+  }
+  recordCalibration(window, pctReal, tokens);
+  return {
+    ok: true,
+    window,
+    pct: pctReal,
+    tokens,
+    derivedLimit: Math.round(tokens / (pctReal / 100)),
+  };
+}
+
 // Export all API functions
 export const api = {
   getProcessos,
@@ -1444,4 +1606,5 @@ export const api = {
   sendToSatellite,
   getSessions,
   getSessionTranscript,
+  calibrateRateLimit,
 };
