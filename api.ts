@@ -265,11 +265,17 @@ function readCronRunState(logPath: string | null): { lastRun?: string; lastStatu
       return { lastRun, lastStatus: lastFailure > lastSuccess ? "err" : "ok" };
     }
 
-    // 2) Sem veredito explícito → heurística de palavras
-    const errSignals = /(error|erro|traceback|exception|failed|falhou|exit code [1-9]|❌|🔴|no such file|modulenotfound|timeout)/;
-    const warnSignals = /(warn|aviso|retry|tentativa|skip|⚠)/;
+    // 2) Sem veredito explícito → heurística de palavras.
+    // Mas se a última linha disser "concluído", o job terminou ok (reindex, otimizador, etc).
+    if (/conclu[ií]do/.test(tail.split("\n").filter(Boolean).slice(-3).join(" "))) {
+      return { lastRun, lastStatus: "ok" };
+    }
+    // Ignora warnings benignos de libs (HF Hub, torch BertModel LOAD REPORT, etc)
+    const benign = /(unauthenticated requests|hf_token|hf hub|load report|unexpected\s*\||position_ids|deprecationwarning|futurewarning)/;
+    const errSignals = /(error|erro|traceback|exception|failed|falhou|exit code [1-9]|❌|🔴|no such file|modulenotfound)/;
+    const warnSignals = /(\bwarn\b|aviso|retry|tentativa|⚠)/;
     if (errSignals.test(tail)) return { lastRun, lastStatus: "err" };
-    if (warnSignals.test(tail)) return { lastRun, lastStatus: "warn" };
+    if (warnSignals.test(tail) && !benign.test(tail)) return { lastRun, lastStatus: "warn" };
     return { lastRun, lastStatus: "ok" };
   } catch {
     return { lastStatus: "warn" }; // log não existe → nunca rodou
