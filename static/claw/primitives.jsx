@@ -24,6 +24,9 @@ function Stat({ label, value, delta, deltaDir, deltaSub, icon, spark }) {
 
 function Sparkline({ values, className, strokeOnly }) {
   const w = 120, h = 40, pad = 2;
+  // Guard: com 0 ou 1 ponto não há linha a desenhar — evita path SVG inválido
+  // (" L.. Z" sem 'M' inicial) que polui o console com erros de <path>.
+  if (!Array.isArray(values) || values.length < 2) return null;
   const max = Math.max(...values, 1);
   const min = Math.min(...values, 0);
   const range = max - min || 1;

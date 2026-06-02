@@ -165,6 +165,9 @@ export async function getSatellites(): Promise<SatelliteStatus[]> {
     { id: "araticum", name: "Araticum", bot: "@Araticum_bot", status: "offline", model: readSatelliteModel("araticum") },
     { id: "designer", name: "Designer", bot: "@Designer_bot", status: "offline", model: readSatelliteModel("designer") },
     { id: "claudeclaw", name: "ClaudeClaw", bot: "@ClaudeClaw_Danbot", status: "offline", model: readSatelliteModel("claudeclaw") },
+    // Memória persistente (claude-mem): worker + ChromaDB rodam 24/7. É um agente
+    // de longa duração — mais autônomo que um cron. Status detectado por processo.
+    { id: "memoria", name: "Memória", bot: "claude-mem", status: "offline", model: "chroma + worker" },
   ];
 
   // 1) Detecta processos rodando (verdade absoluta).
@@ -184,6 +187,11 @@ export async function getSatellites(): Promise<SatelliteStatus[]> {
     const matches = (re: RegExp) => lines.some(l => re.test(l));
     if (sat.id === "claudeclaw") {
       if (matches(/claudeclaw\/claudeclaw\/[\d.]+\/src\/index\.ts.*start/)) {
+        sat.status = "online";
+      }
+    } else if (sat.id === "memoria") {
+      // claude-mem: o daemon de verdade é o worker-service. Online se ele roda.
+      if (matches(/claude-mem\/[\d.]+\/scripts\/worker-service\.cjs.*--daemon/)) {
         sat.status = "online";
       }
     } else {
@@ -1286,7 +1294,7 @@ interface RateLimitWindow {
   opusTokens: number;        // quanto do consumo é Opus
   burnRatePerMin: number;    // tokens/min recentes
   etaMinutes: number | null; // min até bater o limite no ritmo atual
-  limitSource: "calibrated" | "p90" | "tier";  // origem do denominador
+  limitSource: "official" | "calibrated" | "p90" | "tier";  // origem do denominador
   calibratedAgeHours: number | null;           // idade da última calibração
   // ── frescor dos dados (correção 100% fantasma) ──
   dataAgeMinutes: number;    // há quanto tempo foi o último turn registrado
@@ -1299,7 +1307,34 @@ interface RateLimitInfo {
   tier: string;
   five_hour: RateLimitWindow;
   weekly: RateLimitWindow;
-  source: "calibrated" | "p90" | "estimate";
+  source: "official" | "calibrated" | "p90" | "estimate";
+}
+
+// ── Fonte oficial (headers anthropic-ratelimit-unified-*) ──
+// Coletada por scripts/ratelimit_official.py (cron de hora em hora).
+// Quando fresca, é a verdade absoluta da Anthropic — supera qualquer estimativa.
+const OFFICIAL_RL_PATH = "/home/danilo/.claude/ratelimit_official.json";
+const OFFICIAL_MAX_AGE_MS = 75 * 60 * 1000; // 75min: cron roda de hora em hora + folga
+
+interface OfficialRL {
+  collected_at: number; // epoch segundos
+  five_hour: { utilization: number | null; status: string | null; reset: number | null };
+  weekly: { utilization: number | null; status: string | null; reset: number | null };
+  representative_claim: string | null;
+  overall_status: string | null;
+}
+
+// Lê o JSON oficial se existir e estiver fresco. Senão retorna null (cai pra estimativa).
+function readOfficialRL(): OfficialRL | null {
+  try {
+    const raw = require("fs").readFileSync(OFFICIAL_RL_PATH, "utf-8");
+    const data = JSON.parse(raw) as OfficialRL;
+    const ageMs = Date.now() - data.collected_at * 1000;
+    if (ageMs > OFFICIAL_MAX_AGE_MS) return null; // velho demais → não confia
+    return data;
+  } catch {
+    return null;
+  }
 }
 
 // Calibrado em 2026-05-17 com Danilo: 1.26M = 24% (5h), 15.1M = 11% (semana)
@@ -1515,26 +1550,52 @@ export async function getRateLimit(): Promise<RateLimitInfo> {
 
   const rank = { calibrated: 3, p90: 2, tier: 1 } as const;
   const best = rank[lim5h.source] >= rank[limWeek.source] ? lim5h.source : limWeek.source;
-  const overallSource = best === "tier" ? "estimate" : best;
+  let overallSource: "official" | "calibrated" | "p90" | "estimate" =
+    best === "tier" ? "estimate" : best;
 
   // Frescor dos dados — distingue "limite atingido" de "scan parado"
   const ageMin = dataAgeMinutes();
-  const fresh5h = classifyFreshness(ageMin, p5h);
-  const freshWeek = classifyFreshness(ageMin, pWeek);
+
+  // ── Sobreposição OFICIAL ──
+  // Se o coletor (cron) gravou utilização fresca da Anthropic, ela é a verdade.
+  // Sobrepõe pressão/status/reset; mantém tokens estimados (a API não os expõe).
+  const official = readOfficialRL();
+  const off5hUtil = official?.five_hour?.utilization;
+  const offWeekUtil = official?.weekly?.utilization;
+  const has5h = official != null && typeof off5hUtil === "number";
+  const hasWeek = official != null && typeof offWeekUtil === "number";
+
+  const p5h_final = has5h ? Math.min(1, off5hUtil as number) : p5h;
+  const pWeek_final = hasWeek ? Math.min(1, offWeekUtil as number) : pWeek;
+  const src5h: RateLimitWindow["limitSource"] = has5h ? "official" : lim5h.source;
+  const srcWeek: RateLimitWindow["limitSource"] = hasWeek ? "official" : limWeek.source;
+  if (has5h || hasWeek) overallSource = "official";
+
+  // Reset oficial (epoch s) tem prioridade quando disponível
+  const reset5h_final = has5h && official!.five_hour.reset
+    ? new Date(official!.five_hour.reset! * 1000).toISOString()
+    : fiveHourReset;
+  const resetWeek_final = hasWeek && official!.weekly.reset
+    ? new Date(official!.weekly.reset! * 1000).toISOString()
+    : weeklyReset;
+
+  // Frescor: com dado oficial fresco, a leitura é confiável por definição.
+  const fresh5h = has5h ? "fresh" : classifyFreshness(ageMin, p5h_final);
+  const freshWeek = hasWeek ? "fresh" : classifyFreshness(ageMin, pWeek_final);
 
   return {
     tier,
     five_hour: {
       tokens: tokens5h,
       limit: lim5h.limit,
-      pressure: p5h,
-      pressurePct: Math.round(p5h * 100),
-      status: statusFromPressure(p5h),
-      resetAt: fiveHourReset,
+      pressure: p5h_final,
+      pressurePct: Math.round(p5h_final * 100),
+      status: statusFromPressure(p5h_final),
+      resetAt: reset5h_final,
       opusTokens: opusTokensIn(fiveHourSince),
       burnRatePerMin: burn5h.burn,
       etaMinutes: burn5h.eta,
-      limitSource: lim5h.source,
+      limitSource: src5h,
       calibratedAgeHours: lim5h.ageHours === null ? null : Math.round(lim5h.ageHours * 10) / 10,
       dataAgeMinutes: ageMin,
       freshness: fresh5h,
@@ -1542,14 +1603,14 @@ export async function getRateLimit(): Promise<RateLimitInfo> {
     weekly: {
       tokens: tokensWeek,
       limit: limWeek.limit,
-      pressure: pWeek,
-      pressurePct: Math.round(pWeek * 100),
-      status: statusFromPressure(pWeek),
-      resetAt: weeklyReset,
+      pressure: pWeek_final,
+      pressurePct: Math.round(pWeek_final * 100),
+      status: statusFromPressure(pWeek_final),
+      resetAt: resetWeek_final,
       opusTokens: opusTokensIn(weekSince),
       burnRatePerMin: burnWeek.burn,
       etaMinutes: burnWeek.eta,
-      limitSource: limWeek.source,
+      limitSource: srcWeek,
       calibratedAgeHours: limWeek.ageHours === null ? null : Math.round(limWeek.ageHours * 10) / 10,
       dataAgeMinutes: ageMin,
       freshness: freshWeek,

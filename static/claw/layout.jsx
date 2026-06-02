@@ -7,9 +7,9 @@ const NAV = [
     { key: 'usage',     icon: 'usage',     label: 'Consumo',   badge: null },
   ]},
   { sector: 'Agentes', items: [
-    { key: 'agents',    icon: 'agents',    label: 'Agentes',   badge: '6' },
+    { key: 'agents',    icon: 'agents',    label: 'Agentes',   badge: null },
     { key: 'sessions',  icon: 'sessions',  label: 'Sessões',   badge: null },
-    { key: 'satellites',icon: 'channels',  label: 'Satellites',badge: '3' },
+    { key: 'satellites',icon: 'channels',  label: 'Satellites',badge: null },
   ]},
   { sector: 'Plugins', items: [
     { key: 'litigation',icon: 'shield',    label: 'BR-Litigation', badge: null },
@@ -44,6 +44,16 @@ const PAGE_META = {
 };
 
 function Sidebar({ active, onNav, collapsed, setCollapsed, mobileOpen }) {
+  // Badges dinâmicos a partir dos dados reais (antes eram mock fixo '6'/'3').
+  const d = (typeof window !== 'undefined' && window.CC_DATA) || {};
+  const sats = d.satellites || [];
+  const onlineSats = sats.filter(s => s.status === 'online').length;
+  const activeSessions = (d.sessions || []).filter(s => s.status === 'active').length;
+  const dynBadge = {
+    agents: sats.length ? `${onlineSats}/${sats.length}` : null,
+    satellites: sats.length ? String(onlineSats) : null,
+    sessions: activeSessions ? String(activeSessions) : null,
+  };
   return (
     <aside id="cc-sidebar-nav" className={`hc-sidebar${mobileOpen ? ' mobile-open' : ''}`}>
       <div className="hc-brand">
@@ -73,7 +83,7 @@ function Sidebar({ active, onNav, collapsed, setCollapsed, mobileOpen }) {
               >
                 <Icon name={item.icon} size={16} stroke={1.75} />
                 <span className="label">{item.label}</span>
-                {item.badge && <span className="badge">{item.badge}</span>}
+                {(dynBadge[item.key] ?? item.badge) && <span className="badge">{dynBadge[item.key] ?? item.badge}</span>}
               </button>
             ))}
           </div>

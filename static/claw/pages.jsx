@@ -105,7 +105,7 @@ function Dashboard({ data, setActive }) {
             )}
           </div>
         </div>
-        <Stat label="Agentes" value={data.agents.filter(a=>a.status==='online'||a.status==='active').length + ' / ' + data.agents.length} icon="agents" spark={[2,3,3,4,4,4,5,4,4,5,5,6]} />
+        <Stat label="Agentes" value={data.satellites.filter(s=>s.status==='online').length + ' / ' + data.satellites.length} icon="agents" />
         <Stat label="Sessões" value={data.sessions.filter(s=>s.status==='active').length} icon="sessions" spark={[1,1,1,2,2,1,1,2,2,2,2,2]} />
         <Stat label="Tokens hoje" value={(data.usage.today.tokens/1000).toFixed(1) + 'k'} icon="zap" spark={data.usage.hourly.slice(-12)} />
         <Stat
